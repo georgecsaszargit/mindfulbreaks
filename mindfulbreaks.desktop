@@ -15,7 +15,7 @@ TryExec=/home/george/miniconda3/condabin/conda
 # The 'bash -c' command allows us to first change directory ('cd')
 # and then execute the application. This ensures the app's working
 # directory is correct for finding local files like 'notification.wav'.
-Exec=bash -c "cd '/home/george/Programs/mindfulbreaks' && '/home/george/miniconda3/condabin/conda' run -n mindfulbreaks --no-capture-output --live-stream python mindful_break_app.py"
+Exec=bash -c "cd '/home/george/Git_Repos/mindfulbreaks' && '/home/george/miniconda3/condabin/conda' run -n mindfulbreaks --no-capture-output --live-stream python mindful_break_app.py"
 
 Icon=/home/george/Programs/mindfulbreaks/icon.png
 
