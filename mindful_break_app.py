@@ -238,6 +238,7 @@ class MindfulBreakApp(Gtk.Application):
         )
 
         print("App: Connecting overlay signals...")
+        self.break_overlay_window.connect('dismissed', self.on_overlay_dismissed)        
         self.break_overlay_window.connect('postponed', self.on_overlay_postponed)
         self.break_overlay_window.connect('destroy', self.on_overlay_window_destroyed)
         print("App: Showing overlay...")
@@ -392,6 +393,15 @@ class MindfulBreakApp(Gtk.Application):
          print("App: Settings window destroyed.")
          if self.settings_window == widget:
               self.settings_window = None
+
+    # --- Overlay Window Handlers ---
+    def on_overlay_dismissed(self, overlay_window):
+        print("App: Handling overlay dismissal (Done) signal...")
+        if not self.settings_manager or not self.timer_manager: return
+        # This effectively ends the break and starts the next work cycle
+        interval = self.settings_manager.get_break_interval()
+        self.timer_manager.set_interval(interval)
+        self.timer_manager.start()
 
     def on_overlay_postponed(self, overlay_window, minutes):
         print(f"App: Handling overlay postpone signal ({minutes} minutes)...")

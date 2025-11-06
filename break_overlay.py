@@ -22,6 +22,7 @@ class BreakOverlayWindow(Gtk.Window): # Inherit from Gtk.Window
     """
 
     __gsignals__ = {
+        'dismissed': (GObject.SignalFlags.RUN_FIRST, None, ()),
         'postponed': (GObject.SignalFlags.RUN_FIRST, None, (int,)), # Emits postpone minutes
     }
 
@@ -106,7 +107,7 @@ class BreakOverlayWindow(Gtk.Window): # Inherit from Gtk.Window
         self.action_buttons = []  # Store buttons to enable them later
 
         # --- Postpone Buttons ---
-        # Create buttons in a loop to ensure consistent styling and state
+        # --- Create Postpone Buttons ---
         for minutes in [5, 10, 20, 30]:
             btn = Gtk.Button(label=f"Postpone {minutes} min")
             btn.connect('clicked', self._on_postpone_clicked, minutes)
@@ -116,6 +117,16 @@ class BreakOverlayWindow(Gtk.Window): # Inherit from Gtk.Window
             # Add to layout and list for later enabling
             button_box.pack_start(btn, False, False, 0)
             self.action_buttons.append(btn)
+
+        # --- Create Done Button ---
+        btn_done = Gtk.Button(label="Done")
+        btn_done.connect('clicked', self._on_done_clicked)
+        # Add both classes: base style and override style
+        btn_done.get_style_context().add_class("overlay-button")
+        btn_done.get_style_context().add_class("overlay-button-done")
+        btn_done.set_sensitive(False) # Also disable it initially
+        content_box.pack_start(btn_done, False, False, 15) # Add with margin
+        self.action_buttons.append(btn_done) # Add to the list to be enabled
 
         # --- Apply CSS ---
         self._apply_css()
@@ -146,6 +157,18 @@ class BreakOverlayWindow(Gtk.Window): # Inherit from Gtk.Window
         }
         button.overlay-button:hover { background-color: #666; }
         button.overlay-button:active { background-color: #444; }
+        /* Style for the 'Done' button to make it stand out */
+        button.overlay-button-done {
+            font-size: 16pt;
+            padding: 12px 24px;
+            background-color: #357EC7; /* A suggested action blue */
+        }
+        button.overlay-button-done:hover {
+            background-color: #4682B4;
+        }
+        button.overlay-button-done:active {
+            background-color: #2E6B9A;
+        }
         """
         try:
             provider.load_from_data(css.encode('utf-8'))
@@ -221,6 +244,12 @@ class BreakOverlayWindow(Gtk.Window): # Inherit from Gtk.Window
         """
         print(f"BreakOverlayWindow: Postpone {minutes} min clicked.")
         self.emit('postponed', minutes) # Emit signal BEFORE destroy
+        self.hide_and_stop_elapsed_timer()
+
+    def _on_done_clicked(self, button):
+        """Handles click on the Done button."""
+        print("BreakOverlayWindow: Done clicked.")
+        self.emit('dismissed')        
         self.hide_and_stop_elapsed_timer()
 
 
