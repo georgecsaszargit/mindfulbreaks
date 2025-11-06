@@ -1,0 +1,2785 @@
+===== FILE: ./notification.wav =====
+[BINARY FILE]
+
+
+
+===== FILE: ./mindfulbreaks.desktop =====
+[Desktop Entry]
+Version=1.0
+Name=Mindful Break
+GenericName=Break Reminder
+Comment=Take regular breaks from your computer
+Keywords=break;timer;reminder;health;ergonomics;
+
+# IMPORTANT: You MUST edit the 'Exec' line below!
+# Replace '/path/to/your/conda/bin/conda' with the actual absolute path to your conda binary
+# (e.g., /home/george/miniconda3/bin/conda or /home/george/anaconda3/bin/conda)
+# Replace '/full/path/to/your/mindfulbreak-project' with the actual absolute path
+# to the directory containing mindful_break_app.py
+Exec=/home/george/miniconda3/condabin/conda run -n mindfulbreaks --no-capture-output --live-stream python /home/george/Programs/mindfulbreaks/mindful_break_app.py
+
+# IMPORTANT: You MUST edit the 'Icon' line below!
+# Replace '/full/path/to/your/mindfulbreak-project/icon.png' with the absolute path
+# to an icon file (e.g., .png or .svg) for the application.
+# Alternatively, install an icon named 'mindfulbreak' system-wide and just use Icon=mindfulbreak
+Icon=/home/george/Programs/mindfulbreaks/icon.png
+
+Terminal=false
+Type=Application
+Categories=Utility;GTK; # Add others like GNOME; Office; if appropriate
+StartupNotify=false
+
+
+
+===== FILE: ./timer_manager.py =====
+import sys
+import gi
+import time # Used only for test printing
+
+try:
+    gi.require_version('GLib', '2.0')
+    gi.require_version('GObject', '2.0')
+except ValueError as e:
+    print(f"Error: Could not satisfy GLib/GObject version requirement. {e}", file=sys.stderr)
+    sys.exit(1)
+
+from gi.repository import GLib, GObject
+
+class TimerManager(GObject.Object):
+    """
+    Manages the countdown timer logic, state machine, and notifications.
+    Inherits from GObject.Object to support GSignals.
+    """
+
+    # --- Define states ---
+    STATE_STOPPED = 0
+    STATE_RUNNING = 1
+    STATE_PAUSED = 2
+    STATE_BREAK_ACTIVE = 3 # Timer reached zero, waiting for user interaction
+
+    # --- Define signals ---
+    # Signals must be defined within the class scope using GObject.Signal
+    # Format: signal_name = GObject.Signal(name, flags, return_type, (param_types...))
+    __gsignals__ = {
+        'timer_started': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'timer_paused': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'timer_resumed': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'timer_stopped': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        # Emits remaining seconds as an integer parameter
+        'timer_tick': (GObject.SignalFlags.RUN_FIRST, None, (int,)),
+        'break_started': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        # Could add a dedicated postpone signal if needed, but started covers it
+        # 'timer_postponed': (GObject.SignalFlags.RUN_FIRST, None, (int,)), # Postponed minutes
+    }
+
+    def __init__(self):
+        """Initializes the TimerManager."""
+        # Initialize the parent GObject class
+        GObject.Object.__init__(self)
+
+        self._state = self.STATE_STOPPED
+        self._timer_source_id = None # Stores the ID returned by GLib.timeout_add
+        self._remaining_seconds = 0
+        self._configured_interval_seconds = 0 # Default interval set via set_interval
+
+    # --- Public Methods ---
+
+    def set_interval(self, minutes: float): # Allow float for testing fractions
+        """
+        Sets the default interval for the timer. Does not start the timer.
+
+        Args:
+            minutes: The interval duration in minutes (must result in >= 1 second).
+        """
+        interval_seconds = int(round(minutes * 60)) # Convert to seconds and round nicely
+        if interval_seconds < 1:
+            print(f"Warning: Calculated interval ({interval_seconds}s from {minutes}min) is less than 1 second. Setting to 1 second.", file=sys.stderr)
+            interval_seconds = 1
+
+        self._configured_interval_seconds = interval_seconds
+        # If stopped, update remaining time to the new interval potentially
+        # If running/paused, the current cycle continues with the old interval.
+        # The new interval applies on the *next* full start/reset.
+        # If we are stopped, we can prime remaining_seconds for the next start.
+        if self._state == self.STATE_STOPPED:
+            self._remaining_seconds = self._configured_interval_seconds
+        print(f"Timer interval set to {minutes:.2f} minutes ({self._configured_interval_seconds} seconds)")
+
+
+    def start(self):
+        """
+        Starts the timer from the configured interval.
+        If already running, it effectively restarts the timer.
+        If paused, it restarts from the configured interval.
+        """
+        print("TimerManager: Start requested.")
+        self._stop_internal_timer() # Clear any existing timer source
+
+        if self._configured_interval_seconds <= 0:
+            print("Warning: Cannot start timer, interval not set or is zero.", file=sys.stderr)
+            return
+
+        self._state = self.STATE_RUNNING
+        self._remaining_seconds = self._configured_interval_seconds
+        # Start the periodic timer, calling _tick every second (1000ms)
+        self._timer_source_id = GLib.timeout_add_seconds(1, self._tick)
+        self.emit('timer_started')
+        # Emit initial tick immediately
+        self.emit('timer_tick', self._remaining_seconds)
+        print(f"TimerManager: Started with {self._remaining_seconds} seconds.")
+
+
+    def pause(self):
+        """
+        Pauses the timer if it is currently running.
+        """
+        print("TimerManager: Pause requested.")
+        if self._state == self.STATE_RUNNING:
+            self._state = self.STATE_PAUSED
+            self._stop_internal_timer() # Stop the GLib timer
+            self.emit('timer_paused')
+            print(f"TimerManager: Paused at {self._remaining_seconds} seconds.")
+        else:
+            print(f"TimerManager: Cannot pause, not running (state={self._state})")
+
+
+    def resume(self):
+        """
+        Resumes the timer if it is currently paused.
+        """
+        print("TimerManager: Resume requested.")
+        if self._state == self.STATE_PAUSED:
+            self._state = self.STATE_RUNNING
+            # Ensure we don't resume a timer that already finished while paused
+            if self._remaining_seconds > 0:
+                 # Restart the GLib timer
+                self._timer_source_id = GLib.timeout_add_seconds(1, self._tick)
+                self.emit('timer_resumed')
+                # Emit current time immediately on resume
+                self.emit('timer_tick', self._remaining_seconds)
+                print(f"TimerManager: Resumed with {self._remaining_seconds} seconds.")
+            else:
+                 # This case shouldn't normally happen if pause stops ticks, but safety first
+                 print("TimerManager: Resume requested but remaining time is zero. Entering break state.")
+                 self._enter_break_state()
+        else:
+            print(f"TimerManager: Cannot resume, not paused (state={self._state})")
+
+
+    def stop(self):
+            """
+            Stops the timer completely, regardless of state.
+            Resets remaining time based on configured interval for next start.
+            Always emits 'timer_stopped' signal if the state changes to stopped.
+            """
+            print("TimerManager: Stop requested.")
+            previous_state = self._state # Store previous state
+            self._stop_internal_timer()
+            self._state = self.STATE_STOPPED
+            # Reset remaining time for the next potential start
+            self._remaining_seconds = self._configured_interval_seconds
+            # Emit stopped signal if the state actually changed to stopped by this call
+            if previous_state != self.STATE_STOPPED: # <--- This is the key condition
+                 self.emit('timer_stopped')
+            print("TimerManager: Stopped.")
+
+    def postpone(self, minutes: float): # Allow float for fractions
+        """
+        Starts a shorter timer interval immediately (used after a break overlay).
+
+        Args:
+            minutes: The postpone duration in minutes (e.g., 5/60 for 5s).
+                     Must result in >= 1 second.
+        """
+        print(f"TimerManager: Postpone requested for {minutes:.2f} minutes.")
+        self._stop_internal_timer() # Clear any existing timer source
+
+        postpone_seconds = int(round(minutes * 60)) # Convert to seconds and round
+        if postpone_seconds < 1:
+            print(f"Warning: Invalid postpone duration ({postpone_seconds}s from {minutes}min), using 1 second.", file=sys.stderr)
+            postpone_seconds = 1
+
+        self._state = self.STATE_RUNNING
+        self._remaining_seconds = postpone_seconds
+        self._timer_source_id = GLib.timeout_add_seconds(1, self._tick)
+        # We reuse 'timer_started' for simplicity, could have a dedicated signal
+        self.emit('timer_started')
+        # Emit initial tick immediately
+        self.emit('timer_tick', self._remaining_seconds)
+        print(f"TimerManager: Postponed. Starting {self._remaining_seconds} second countdown.")
+
+    # --- Private Methods ---
+
+    def _stop_internal_timer(self):
+        """Safely removes the GLib timer source if it exists."""
+        if self._timer_source_id:
+            GLib.source_remove(self._timer_source_id)
+            self._timer_source_id = None
+            # print("TimerManager: Internal GLib timer source stopped.")
+
+
+    def _tick(self) -> bool:
+        """
+        Internal callback executed every second by GLib.timeout_add_seconds.
+        Decrements remaining time and checks for break condition.
+
+        Returns:
+            bool: True to keep the timer running, False to stop it.
+        """
+        if self._state != self.STATE_RUNNING:
+            # Should not happen if timer is managed correctly, but safety check
+            print("Warning: _tick called while not in RUNNING state.", file=sys.stderr)
+            self._timer_source_id = None # Ensure it stops
+            return False # Stop the timer
+
+        self._remaining_seconds -= 1
+        # print(f"TimerManager: Tick! Remaining: {self._remaining_seconds}s") # Debug print
+
+        if self._remaining_seconds > 0:
+            self.emit('timer_tick', self._remaining_seconds)
+            return True # Continue timer
+        else:
+            print("TimerManager: Timer reached zero.")
+            self._enter_break_state()
+            return False # Stop the timer (GLib.source_remove is implicit when False is returned)
+
+    def _enter_break_state(self):
+        """Transitions the timer to the break state."""
+        self._state = self.STATE_BREAK_ACTIVE
+        self._remaining_seconds = 0 # Ensure it's exactly zero
+        self._timer_source_id = None # Timer source is automatically removed on returning False
+        self.emit('break_started')
+        print("TimerManager: Entered BREAK_ACTIVE state.")
+
+
+    # --- Public property accessors (optional but good practice) ---
+    @property
+    def state(self):
+        return self._state
+
+    @property
+    def remaining_seconds(self):
+        return self._remaining_seconds
+
+    @property
+    def configured_interval_seconds(self):
+         return self._configured_interval_seconds
+
+
+# --- Test Code ---
+if __name__ == '__main__':
+    print("Running TimerManager Test...")
+
+    main_loop = GLib.MainLoop()
+    timer = TimerManager()
+
+    # --- Signal Handlers ---
+    def on_started(emitter):
+        print("[Signal Handler] Timer Started")
+
+    def on_paused(emitter):
+        print("[Signal Handler] Timer Paused")
+
+    def on_resumed(emitter):
+        print("[Signal Handler] Timer Resumed")
+
+    # *** MODIFIED on_stopped handler ***
+    def on_stopped(emitter):
+        print("[Signal Handler] Timer Stopped")
+        # Quit the main loop *after* the stopped signal is processed
+        print("Quitting main loop from on_stopped handler.")
+        if main_loop.is_running():
+            main_loop.quit()
+
+    def on_tick(emitter, seconds_left):
+        print(f"[Signal Handler] Tick! {seconds_left} seconds remaining.")
+
+    # --- Test Control Functions ---
+    def test_stop_scheduled(): # Renamed function that actually stops
+        print("\n--- Testing Stop ---")
+        timer.stop()
+        # *** REMOVED main_loop.quit() call from here ***
+        # The on_stopped handler will now quit the loop.
+        # Add a small timeout just in case stop somehow doesn't emit signal (failsafe)
+        def failsafe_quit():
+            if main_loop.is_running():
+                print("Failsafe quit triggered (on_stopped didn't run?).")
+                main_loop.quit()
+            return False
+        GLib.timeout_add_seconds(2, failsafe_quit) # Quit after 2s if not already quit
+        return False # Important: idle_add runs repeatedly unless you return False
+
+    def on_break_final(emitter): # Handler for the second break (after postpone)
+        print("[Signal Handler] Final Break Started (will schedule stop).")
+        # Schedule the stop using idle_add to run *after* this handler completes
+        GLib.idle_add(test_stop_scheduled)
+        # No need to return False here, signal handlers don't loop
+
+    def on_break_initial(emitter): # Handler for the first break
+        print("[Signal Handler] Initial Break Started!")
+        # Schedule the postpone action
+        GLib.timeout_add_seconds(2, test_postpone) # Wait 2s then postpone
+        # No need to return False here
+
+    def test_postpone():
+        print("\n--- Testing Postpone (10 seconds) ---")
+        # Use 10/60 minutes for 10 seconds
+        timer.postpone(10 / 60)
+        # Disconnect the initial break handler
+        try:
+            timer.disconnect_by_func(on_break_initial)
+        except TypeError:
+             print("Warning: Could not disconnect on_break_initial handler.")
+        # Connect the final break handler
+        timer.connect('break_started', on_break_final)
+        return False # timeout_add runs repeatedly unless False is returned
+
+    def test_pause():
+        print("\n--- Testing Pause ---")
+        timer.pause()
+        # Schedule resume after 2 seconds of pause
+        GLib.timeout_add_seconds(2, test_resume)
+        return False # timeout_add runs repeatedly unless False is returned
+
+    def test_resume():
+        print("\n--- Testing Resume ---")
+        timer.resume()
+        # Let it run to completion now, on_break_initial will handle next step
+        return False # timeout_add runs repeatedly unless False is returned
+
+    # --- Connect Initial Handlers ---
+    timer.connect('timer_started', on_started)
+    timer.connect('timer_paused', on_paused)
+    timer.connect('timer_resumed', on_resumed)
+    timer.connect('timer_stopped', on_stopped) # Connect the stop handler
+    timer.connect('timer_tick', on_tick)
+    timer.connect('break_started', on_break_initial) # Connect the first break handler
+
+
+    # --- Test Sequence Setup ---
+    print("\n--- Test Sequence Start ---")
+
+    # 1. Set interval (use 6/60 minutes for 6 seconds)
+    print("Setting interval to 6 seconds (0.10 minutes)...")
+    test_interval_minutes = 6 / 60
+    timer.set_interval(test_interval_minutes)
+    print(f"Configured interval: {timer.configured_interval_seconds}s")
+    print(f"Initial state: {timer.state}, Remaining: {timer.remaining_seconds}s")
+
+    # 2. Start the timer
+    print("\nStarting timer...")
+    timer.start()
+
+    # 3. Schedule Pause after 2 seconds
+    # GLib timers are relative to when the main loop starts processing them
+    GLib.timeout_add_seconds(2, test_pause)
+
+
+    # --- Run Main Loop ---
+    print("\nStarting GLib MainLoop... (Ctrl+C to interrupt if needed)")
+    try:
+        main_loop.run()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+        if main_loop.is_running():
+            main_loop.quit()
+
+    print("\n--- Test Sequence End ---")
+
+
+
+===== FILE: ./idle_monitor.py =====
+# File: idle_monitor.py
+import sys
+import ctypes
+import ctypes.util
+import time # For testing delays
+
+import gi
+try:
+    gi.require_version('GLib', '2.0')
+    gi.require_version('GObject', '2.0')
+except ValueError as e:
+    print(f"Error: Could not satisfy GLib/GObject version requirement. {e}", file=sys.stderr)
+    sys.exit(1)
+
+from gi.repository import GLib, GObject
+
+# --- ctypes definitions for X11 and XScreenSaver ---
+
+# Basic X11 types
+Display = ctypes.c_void_p # Treat Display* as opaque pointer
+Window = ctypes.c_ulong
+Drawable = ctypes.c_ulong
+XID = ctypes.c_ulong
+
+# Define the XScreenSaverInfo struct based on <X11/extensions/scrnsaver.h>
+class XScreenSaverInfo(ctypes.Structure):
+    _fields_ = [
+        ('window', Window),            # screen saver window
+        ('state', ctypes.c_int),       # ScreenSaverOff, ScreenSaverOn, ScreenSaverDisabled
+        ('kind', ctypes.c_int),        # ScreenSaverBlanked, ScreenSaverInternal, ScreenSaverExternal
+        ('til_or_since', ctypes.c_ulong), # milliseconds
+        ('idle', ctypes.c_ulong),      # milliseconds
+        ('eventMask', ctypes.c_ulong)  # events
+    ]
+
+# Find libraries
+libX11_path = ctypes.util.find_library('X11')
+libXss_path = ctypes.util.find_library('Xss') # Usually libXss.so.1
+
+if not libX11_path:
+    raise ImportError("Could not find libX11. System library missing?")
+if not libXss_path:
+    raise ImportError("Could not find libXss. Is libxss1 installed?")
+
+# Load libraries
+try:
+    libX11 = ctypes.CDLL(libX11_path)
+    libXss = ctypes.CDLL(libXss_path)
+except OSError as e:
+     raise ImportError(f"Error loading X11/Xss libraries: {e}")
+
+
+# Define function prototypes we need using ctypes
+
+# XOpenDisplay = (display_name) -> Display*
+libX11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+libX11.XOpenDisplay.restype = Display
+
+# XCloseDisplay = (display) -> int
+libX11.XCloseDisplay.argtypes = [Display]
+libX11.XCloseDisplay.restype = ctypes.c_int
+
+# XDefaultRootWindow = (display) -> Window
+libX11.XDefaultRootWindow.argtypes = [Display]
+libX11.XDefaultRootWindow.restype = Window
+
+# XScreenSaverAllocInfo = () -> XScreenSaverInfo*
+libXss.XScreenSaverAllocInfo.argtypes = []
+libXss.XScreenSaverAllocInfo.restype = ctypes.POINTER(XScreenSaverInfo)
+
+# XScreenSaverQueryInfo = (display, drawable, saver_info) -> int
+libXss.XScreenSaverQueryInfo.argtypes = [Display, Drawable, ctypes.POINTER(XScreenSaverInfo)]
+libXss.XScreenSaverQueryInfo.restype = ctypes.c_int
+
+# XFree = (data) -> int (usually returns void, but ctypes default is int)
+libX11.XFree.argtypes = [ctypes.c_void_p]
+libX11.XFree.restype = ctypes.c_int
+
+# --- IdleMonitor Class ---
+
+class IdleMonitor(GObject.Object):
+    """
+    Monitors user idle time using the XScreenSaver extension and emits signals
+    when the user becomes idle or active after being idle.
+
+    Note: This relies on the X11 ScreenSaver extension and will likely not work
+    correctly under native Wayland sessions unless running via XWayland and
+    the compositor supports the necessary XWayland extensions.
+    """
+    __gsignals__ = {
+        'user_idle': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'user_active': (GObject.SignalFlags.RUN_FIRST, None, ()),
+    }
+
+    DEFAULT_POLL_INTERVAL_SECONDS = 30
+
+    def __init__(self, idle_threshold_seconds: int):
+        """
+        Initializes the IdleMonitor.
+
+        Args:
+            idle_threshold_seconds: The time in seconds after which the user
+                                     is considered idle.
+        """
+        GObject.Object.__init__(self)
+
+        if idle_threshold_seconds < 1:
+            print("Warning: Idle threshold must be at least 1 second. Setting to 1.", file=sys.stderr)
+            idle_threshold_seconds = 1
+        self._idle_threshold_ms = idle_threshold_seconds * 1000
+
+        self._is_idle = False # Current state
+        self._timer_source_id = None
+        self._display = None
+        self._root_window = None
+        self._saver_info = None
+        self._initialized_successfully = False
+
+        try:
+            # Open connection to the X server
+            # Passing None uses the DISPLAY environment variable
+            self._display = libX11.XOpenDisplay(None)
+            if not self._display:
+                raise RuntimeError("Could not open X Display. Is DISPLAY set correctly?")
+
+            # Get the root window
+            self._root_window = libX11.XDefaultRootWindow(self._display)
+            if not self._root_window:
+                libX11.XCloseDisplay(self._display)
+                raise RuntimeError("Could not get default root window.")
+
+            # Allocate the structure to store query results
+            self._saver_info = libXss.XScreenSaverAllocInfo()
+            if not self._saver_info:
+                libX11.XCloseDisplay(self._display)
+                raise RuntimeError("Could not allocate XScreenSaverInfo struct.")
+
+            print(f"IdleMonitor: Initialized successfully. Threshold: {idle_threshold_seconds}s")
+            self._initialized_successfully = True
+
+        except (ImportError, RuntimeError, AttributeError) as e:
+            # AttributeError can happen if a required X function isn't found
+            print(f"Error initializing IdleMonitor (X11/Xss): {e}", file=sys.stderr)
+            print("Idle monitoring will be disabled.", file=sys.stderr)
+            # Ensure cleanup if partially initialized
+            if self._saver_info:
+                # XFree works even if display wasn't fully opened? Let's try.
+                # Might need a specific function for freeing XScreenSaverInfo?
+                # Docs suggest XFree is correct.
+                 try:
+                      libX11.XFree(self._saver_info)
+                 except Exception as free_e:
+                      print(f"Warning: Error during cleanup free: {free_e}", file=sys.stderr)
+                 self._saver_info = None
+            if self._display:
+                 libX11.XCloseDisplay(self._display)
+                 self._display = None
+
+
+    def start(self, poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS):
+        """
+        Starts the periodic polling for idle time.
+
+        Args:
+            poll_interval_seconds: How often to check for idle time.
+        """
+        if not self._initialized_successfully:
+             print("IdleMonitor: Cannot start, initialization failed.", file=sys.stderr)
+             return
+
+        if self._timer_source_id:
+            print("IdleMonitor: Already running.", file=sys.stderr)
+            return
+
+        if poll_interval_seconds < 1:
+            poll_interval_seconds = 1
+
+        print(f"IdleMonitor: Starting polling every {poll_interval_seconds} seconds.")
+        # Check immediately once, then start interval
+        GLib.idle_add(self._check_idle) # Check once on next idle
+        self._timer_source_id = GLib.timeout_add_seconds(poll_interval_seconds, self._check_idle)
+
+
+    def stop(self):
+        """Stops the periodic polling."""
+        print("IdleMonitor: Stop requested.")
+        if self._timer_source_id:
+            GLib.source_remove(self._timer_source_id)
+            self._timer_source_id = None
+            print("IdleMonitor: Polling stopped.")
+        # Cleanup X resources
+        if self._initialized_successfully:
+             if self._saver_info:
+                  try:
+                    libX11.XFree(self._saver_info)
+                  except Exception as e:
+                       print(f"Warning: Error freeing XScreenSaverInfo: {e}", file=sys.stderr)
+                  self._saver_info = None
+             if self._display:
+                  libX11.XCloseDisplay(self._display)
+                  self._display = None
+             self._initialized_successfully = False # Mark as cleaned up
+
+
+    def _check_idle(self) -> bool:
+        """
+        Internal method called periodically to check the idle time.
+        Returns True to keep the timer going (if called by timeout_add),
+        or False if called by idle_add (only run once).
+        """
+        if not self._initialized_successfully or not self._display or not self._saver_info:
+             print("IdleMonitor: Check called but not initialized.", file=sys.stderr)
+             return False # Stop timer if it somehow got started
+
+        try:
+            # Query XScreenSaver
+            status = libXss.XScreenSaverQueryInfo(self._display, self._root_window, self._saver_info)
+
+            if status == 0:
+                 # This seems to indicate an error according to some examples
+                 print("Warning: XScreenSaverQueryInfo returned status 0 (potential error).", file=sys.stderr)
+                 # We might want to stop polling or handle this more gracefully
+                 # For now, just report and continue trying
+                 return True # Keep timer running
+
+            current_idle_ms = self._saver_info.contents.idle
+            # print(f"Idle time: {current_idle_ms} ms") # Debug print
+
+            currently_considered_idle = current_idle_ms >= self._idle_threshold_ms
+
+            # --- State Transition Logic ---
+            if currently_considered_idle and not self._is_idle:
+                self._is_idle = True
+                print("IdleMonitor: User became idle.")
+                self.emit('user_idle')
+            elif not currently_considered_idle and self._is_idle:
+                self._is_idle = False
+                print("IdleMonitor: User became active.")
+                self.emit('user_active')
+
+        except Exception as e:
+            # Catch potential errors during X calls within the callback
+            print(f"Error during idle check: {e}", file=sys.stderr)
+            # Decide if we should stop the timer on error
+            # return False # Option: Stop polling on error
+            pass # Option: Log error and keep trying
+
+        # Keep the timer running if we were called by timeout_add
+        return True if self._timer_source_id else False
+
+
+# --- Test Code ---
+if __name__ == '__main__':
+    print("Running IdleMonitor Test...")
+    print("This requires an X11 session (or XWayland).")
+    print("Test will run for 60 seconds.")
+    print("Try being idle for > 5 seconds, then active again.")
+
+    main_loop = GLib.MainLoop()
+    monitor = None
+
+    # Handler functions
+    def on_user_idle(emitter):
+        print("[Signal Handler] ****** USER IDLE ******")
+
+    def on_user_active(emitter):
+        print("[Signal Handler] ****** USER ACTIVE ******")
+
+    def stop_monitor_and_quit():
+        print("\nStopping monitor and quitting...")
+        if monitor:
+            monitor.stop()
+        if main_loop.is_running():
+            main_loop.quit()
+        return False # Stop timeout
+
+    try:
+        # Create monitor with a 5-second threshold for testing
+        monitor = IdleMonitor(idle_threshold_seconds=5)
+
+        # Only proceed if initialized correctly
+        if monitor._initialized_successfully:
+            # Connect signals
+            monitor.connect('user_idle', on_user_idle)
+            monitor.connect('user_active', on_user_active)
+
+            # Start polling (e.g., every 2 seconds for faster testing feedback)
+            monitor.start(poll_interval_seconds=2)
+
+            # Schedule test shutdown
+            GLib.timeout_add_seconds(60, stop_monitor_and_quit)
+
+            print("\nStarting GLib MainLoop... Monitor is active.")
+            main_loop.run()
+        else:
+            print("\nMonitor did not initialize. Exiting test.")
+
+    except ImportError as e:
+         print(f"\nTest failed due to missing library: {e}")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred during test setup: {e}")
+        if main_loop.is_running():
+            main_loop.quit()
+    finally:
+        # Ensure cleanup happens even if loop wasn't run
+        if monitor and not monitor._initialized_successfully: # Already stopped if quit normally
+             monitor.stop()
+
+
+    print("\n--- Test End ---")
+
+
+
+===== FILE: ./settings_window.py =====
+# File: settings_window.py (GTK3 Fallback Version - Updated)
+import sys
+import gi
+
+try:
+    # Use Gtk 3 for compatibility
+    gi.require_version('Gtk', '3.0')
+    gi.require_version('GLib', '2.0')
+    gi.require_version('GObject', '2.0')
+except ValueError as e:
+    print(f"Error: Could not satisfy Gtk/GLib/GObject version requirement. {e}", file=sys.stderr)
+    sys.exit(1)
+
+from gi.repository import Gtk, GObject, Gio, GLib # Import GLib
+
+# Import the settings manager from Ticket 1
+try:
+    from settings_manager import SettingsManager
+except ImportError as e:
+     print(f"Error: Could not import SettingsManager. Make sure settings_manager.py is in the same directory or Python path. {e}", file=sys.stderr)
+     sys.exit(1)
+
+
+class SettingsWindow(Gtk.Window): # Inherit from Gtk.Window
+    """
+    A preferences window for configuring MindfulBreak settings (GTK3 Version),
+    including break interval and idle detection.
+    """
+
+    # Signal emitted when settings are applied/saved
+    __gsignals__ = {
+        # Keep original signature, main app re-reads all settings on save
+        'settings_saved': (GObject.SignalFlags.RUN_FIRST, None, (int,)), # Emits new interval
+    }
+
+    def __init__(self, settings_manager: SettingsManager, **kwargs):
+        """
+        Initializes the SettingsWindow.
+
+        Args:
+            settings_manager: An instance of the SettingsManager to load/save values.
+            **kwargs: Additional keyword arguments for the Gtk.Window.
+        """
+        super().__init__(title="MindfulBreak Settings", **kwargs)
+        self._settings_manager = settings_manager
+
+        self.set_modal(True)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_border_width(12) # Add some padding
+        self.set_resizable(False)
+
+        # --- Main Box ---
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.add(vbox)
+
+        # --- Break Interval Row ---
+        hbox_interval = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        vbox.pack_start(hbox_interval, True, True, 0)
+
+        label_interval = Gtk.Label(label="Interval Between Breaks (minutes):")
+        label_interval.set_xalign(0)
+        hbox_interval.pack_start(label_interval, False, False, 0)
+
+        self.spin_break_interval = Gtk.SpinButton()
+        adjustment_interval = Gtk.Adjustment(
+            value=self._settings_manager.get_break_interval(),
+            lower=1.0, upper=180.0, step_increment=1.0, page_increment=5.0, page_size=0.0
+        )
+        self.spin_break_interval.set_adjustment(adjustment_interval)
+        self.spin_break_interval.set_digits(0)
+        self.spin_break_interval.set_numeric(True)
+        hbox_interval.pack_start(self.spin_break_interval, True, True, 0)
+
+        # --- Enable Idle Detection Row ---
+        hbox_idle_enable = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        vbox.pack_start(hbox_idle_enable, False, False, 5) # Less vertical space
+
+        label_idle_enable = Gtk.Label(label="Enable Idle Detection:")
+        label_idle_enable.set_xalign(0)
+        hbox_idle_enable.pack_start(label_idle_enable, True, True, 0) # Allow label to expand
+
+        self.switch_idle_enable = Gtk.Switch()
+        self.switch_idle_enable.set_valign(Gtk.Align.CENTER)
+        self.switch_idle_enable.set_active(self._settings_manager.get_idle_monitor_enabled())
+        hbox_idle_enable.pack_end(self.switch_idle_enable, False, False, 0) # Pack switch at end
+
+        # --- Idle Threshold Row ---
+        hbox_idle_threshold = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        vbox.pack_start(hbox_idle_threshold, False, False, 5)
+
+        label_idle_threshold = Gtk.Label(label="Idle Threshold (seconds):")
+        label_idle_threshold.set_xalign(0)
+        hbox_idle_threshold.pack_start(label_idle_threshold, False, False, 0)
+
+        self.spin_idle_threshold = Gtk.SpinButton()
+        adjustment_threshold = Gtk.Adjustment(
+            value=self._settings_manager.get_idle_threshold_seconds(),
+            lower=10.0, upper=600.0, step_increment=5.0, page_increment=30.0, page_size=0.0
+        )
+        self.spin_idle_threshold.set_adjustment(adjustment_threshold)
+        self.spin_idle_threshold.set_digits(0)
+        self.spin_idle_threshold.set_numeric(True)
+        hbox_idle_threshold.pack_start(self.spin_idle_threshold, True, True, 0)
+
+        # --- Separator and Buttons ---
+        vbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 15) # More space before buttons
+
+        action_area = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        action_area.set_halign(Gtk.Align.END) # Align buttons to the right
+        vbox.pack_start(action_area, False, False, 0)
+
+        btn_cancel = Gtk.Button(label="Cancel")
+        btn_save = Gtk.Button(label="Save")
+        btn_save.get_style_context().add_class(Gtk.STYLE_CLASS_SUGGESTED_ACTION)
+
+        action_area.pack_end(btn_save, False, False, 0)
+        action_area.pack_end(btn_cancel, False, False, 0)
+
+        # --- Connect Signals ---
+        # Store initial values for *all* settings to detect changes
+        self._initial_interval = self.spin_break_interval.get_value_as_int()
+        self._initial_idle_enabled = self.switch_idle_enable.get_active()
+        self._initial_idle_threshold = self.spin_idle_threshold.get_value_as_int()
+
+        btn_save.connect("clicked", self._on_save_clicked)
+        btn_cancel.connect("clicked", self._on_cancel_clicked)
+        self.connect("delete-event", self._on_delete_event) # Handle window 'X' button
+
+        print("SettingsWindow (GTK3): Initialized.")
+        self.show_all() # Make window and widgets visible
+
+
+    def _on_save_clicked(self, widget):
+        """Saves all settings if changed and closes the window."""
+        print("SettingsWindow: Save clicked.")
+
+        # Get current values
+        current_interval = self.spin_break_interval.get_value_as_int()
+        current_idle_enabled = self.switch_idle_enable.get_active()
+        current_idle_threshold = self.spin_idle_threshold.get_value_as_int()
+
+        # Check if anything changed
+        interval_changed = current_interval != self._initial_interval
+        idle_enabled_changed = current_idle_enabled != self._initial_idle_enabled
+        idle_threshold_changed = current_idle_threshold != self._initial_idle_threshold
+
+        if not (interval_changed or idle_enabled_changed or idle_threshold_changed):
+            print("SettingsWindow: No changes detected.")
+            self.destroy() # Close without saving if nothing changed
+            return
+
+        print("SettingsWindow: Changes detected, saving...")
+        try:
+            # Save all changed values (SettingsManager handles sync internally)
+            if interval_changed:
+                self._settings_manager.set_break_interval(current_interval)
+            if idle_enabled_changed:
+                 self._settings_manager.set_idle_monitor_enabled(current_idle_enabled)
+            if idle_threshold_changed:
+                 self._settings_manager.set_idle_threshold_seconds(current_idle_threshold)
+
+            # Emit signal AFTER successfully saving
+            self.emit('settings_saved', current_interval) # Keep original signature
+            self.destroy() # Close the window
+
+        except Exception as e:
+             # saved_successfully = False # Not needed if we always destroy
+             print(f"Error saving settings: {e}", file=sys.stderr)
+             # Show error dialog
+             dialog = Gtk.MessageDialog(
+                 transient_for=self, flags=0, message_type=Gtk.MessageType.ERROR,
+                 buttons=Gtk.ButtonsType.CANCEL, text="Error Saving Settings",
+             )
+             dialog.format_secondary_text(str(e))
+             dialog.run()
+             dialog.destroy()
+             # Still destroy the settings window even if save failed? Yes, probably less confusing.
+             self.destroy()
+
+
+    def _on_cancel_clicked(self, widget):
+        """Closes the window without saving."""
+        print("SettingsWindow: Cancel clicked.")
+        self.destroy()
+
+    def _on_delete_event(self, widget, event):
+        """Handles the window close ('X') button like Cancel."""
+        print("SettingsWindow: Delete event (closed).")
+        # Return False to allow the window to close, True would prevent it
+        return False
+
+
+# --- Test Code (GTK3 Version - Update to show new widgets) ---
+if __name__ == '__main__':
+    print("Running SettingsWindow Test (GTK3 Version)...")
+
+    main_loop = GLib.MainLoop()
+    settings_win = None
+
+    def on_settings_saved(emitter, new_interval):
+        print(f"[Signal Handler] ****** settings_saved: New interval = {new_interval} ******")
+        # Add verification for new settings
+        try:
+            import subprocess
+            print("Verifying saved settings using 'gsettings'...")
+            settings_ok = True
+            # Verify Interval
+            result = subprocess.run(['gsettings', 'get', SettingsManager.SCHEMA_ID, SettingsManager.KEY_BREAK_INTERVAL], capture_output=True, text=True, check=True)
+            saved_interval = int(result.stdout.strip().replace('uint32 ', ''))
+            if saved_interval != new_interval:
+                print(f"[Verification] ERROR: Interval mismatch. Expected {new_interval}, got {saved_interval}")
+                settings_ok = False
+
+            # Verify Idle Enabled
+            result = subprocess.run(['gsettings', 'get', SettingsManager.SCHEMA_ID, SettingsManager.KEY_IDLE_ENABLED], capture_output=True, text=True, check=True)
+            saved_idle_enabled = result.stdout.strip().lower() == 'true'
+            # We don't know expected state easily here, just print it
+            print(f"[Verification] Idle Enabled saved as: {saved_idle_enabled}")
+
+             # Verify Idle Threshold
+            result = subprocess.run(['gsettings', 'get', SettingsManager.SCHEMA_ID, SettingsManager.KEY_IDLE_THRESHOLD], capture_output=True, text=True, check=True)
+            saved_idle_threshold = int(result.stdout.strip().replace('uint32 ', ''))
+            # We don't know expected state easily here, just print it
+            print(f"[Verification] Idle Threshold saved as: {saved_idle_threshold}")
+
+            if settings_ok: print("[Verification] Interval OK.")
+
+        except Exception as e:
+             print(f"[Verification] Could not verify with gsettings command: {e}")
+
+        print("Quitting main loop after save.")
+        if main_loop.is_running():
+            main_loop.quit()
+
+    try:
+        settings_mgr = SettingsManager()
+        print(f"Initial interval: {settings_mgr.get_break_interval()}")
+        print(f"Initial idle enabled: {settings_mgr.get_idle_monitor_enabled()}")
+        print(f"Initial idle threshold: {settings_mgr.get_idle_threshold_seconds()}")
+
+        try: Gtk.init_check()
+        except Exception: Gtk.init(None)
+
+        settings_win = SettingsWindow(settings_manager=settings_mgr)
+        settings_win.connect('settings_saved', on_settings_saved)
+        settings_win.connect('destroy', lambda w: main_loop.quit() if main_loop.is_running() else None)
+
+        print("Settings window presented. Use Save/Cancel or close the window.")
+        print("\nStarting Gtk MainLoop...")
+        main_loop.run()
+
+    except RuntimeError as e:
+         print(f"RuntimeError during setup (schema issue?): {e}", file=sys.stderr)
+         if main_loop.is_running(): main_loop.quit()
+    except Exception as e:
+         print(f"Unexpected error during setup: {e}", file=sys.stderr)
+         if main_loop.is_running(): main_loop.quit()
+
+    print("\nTest finished.")
+
+
+
+===== FILE: ./settings_manager.py =====
+# File: settings_manager.py
+import sys
+import gi
+
+try:
+    gi.require_version('Gio', '2.0')
+except ValueError as e:
+    print(f"Error: Could not satisfy Gio version requirement. {e}", file=sys.stderr)
+    sys.exit(1)
+
+from gi.repository import Gio, GLib
+
+class SettingsManager:
+    """
+    Manages application settings using GSettings.
+    """
+    SCHEMA_ID = 'org.example.mindfulbreak'
+    KEY_BREAK_INTERVAL = 'break-interval-minutes'
+    KEY_IDLE_ENABLED = 'idle-monitor-enabled'      # Added
+    KEY_IDLE_THRESHOLD = 'idle-threshold-seconds'  # Added
+
+    def __init__(self, schema_id: str = SCHEMA_ID):
+        """
+        Initializes the SettingsManager.
+
+        Args:
+            schema_id: The GSettings schema ID to use. Defaults to SCHEMA_ID.
+        """
+        self._schema_source = Gio.SettingsSchemaSource.get_default()
+        if not self._schema_source:
+             print("Error: Could not get default GSettings schema source.", file=sys.stderr)
+             # Attempt to load from installed location as a fallback for testing/dev
+             # Using system path first as user path might not exist yet
+             sys_schema_dir = '/usr/share/glib-2.0/schemas'
+             user_schema_dir = GLib.get_user_data_dir() + '/glib-2.0/schemas'
+
+             self._schema_source = Gio.SettingsSchemaSource.new_from_directory(
+                sys_schema_dir,
+                Gio.SettingsSchemaSource.get_default(),
+                False # Read only parent source
+             )
+             if not self._schema_source:
+                 print(f"Warning: Could not create schema source from {sys_schema_dir}.", file=sys.stderr)
+                 # Try user directory
+                 self._schema_source = Gio.SettingsSchemaSource.new_from_directory(
+                     user_schema_dir,
+                     Gio.SettingsSchemaSource.get_default(),
+                     False
+                 )
+                 if not self._schema_source:
+                    raise RuntimeError("Fatal: Cannot access GSettings schema sources.")
+             else:
+                # Add user dir if system dir was found, allows overrides
+                user_source = Gio.SettingsSchemaSource.new_from_directory(
+                     user_schema_dir,
+                     self._schema_source, # Chain parent
+                     False
+                )
+                if user_source:
+                    self._schema_source = user_source # Use user source if available
+                else:
+                     print(f"Warning: Could not access user schema dir {user_schema_dir}", file=sys.stderr)
+
+
+        self._schema = self._schema_source.lookup(schema_id, True) # Recursive lookup
+
+        if not self._schema:
+            # This usually means the schema wasn't compiled/installed correctly
+            raise RuntimeError(f"Fatal: Could not find GSettings schema '{schema_id}'. "
+                               "Ensure it is compiled and installed correctly.")
+
+        try:
+            # Use new_with_path if path is defined in schema (it is)
+            if self._schema.get_path():
+                self.settings = Gio.Settings.new_with_path(schema_id, self._schema.get_path())
+            else:
+                 self.settings = Gio.Settings.new(schema_id)
+
+        except GLib.Error as e:
+             raise RuntimeError(f"Fatal: Could not create GSettings object for schema '{schema_id}'. GError: {e}")
+
+
+    def get_break_interval(self) -> int:
+        """
+        Retrieves the currently configured break interval in minutes.
+
+        Returns:
+            The break interval in minutes (integer).
+        """
+        try:
+            return self.settings.get_uint(self.KEY_BREAK_INTERVAL)
+        except GLib.Error as e:
+            print(f"Warning: Could not get setting '{self.KEY_BREAK_INTERVAL}'. Using default. GError: {e}", file=sys.stderr)
+            # Fallback to schema default if retrieval fails
+            default_value = self.settings.get_default_value(self.KEY_BREAK_INTERVAL)
+            if default_value:
+                return default_value.get_uint32()
+            else:
+                # Hardcoded fallback if even default lookup fails (shouldn't happen)
+                print("Warning: Could not even retrieve default value for interval. Using hardcoded 25.", file=sys.stderr)
+                return 25
+
+
+    def set_break_interval(self, minutes: int):
+        """
+        Sets the break interval in minutes.
+
+        Args:
+            minutes: The desired break interval in minutes (integer >= 1).
+                     Values less than 1 will be treated as 1.
+        """
+        if not isinstance(minutes, int):
+            print(f"Warning: Invalid type for minutes ({type(minutes)}), expected int. Setting to 1.", file=sys.stderr)
+            minutes = 1
+
+        # Ensure minutes is at least 1
+        validated_minutes = max(1, minutes)
+        print(f"[SettingsManager Debug] Attempting to set interval to: {validated_minutes}") # DEBUG
+
+        try:
+            # Set the value in memory
+            success = self.settings.set_uint(self.KEY_BREAK_INTERVAL, validated_minutes)
+            print(f"[SettingsManager Debug] GSettings.set_uint (interval) returned: {success}") # DEBUG
+
+            if not success:
+                 print(f"Warning: GSettings reported failure setting '{self.KEY_BREAK_INTERVAL}'. Value might not be saved.", file=sys.stderr)
+
+            # *** Crucial Step: Ensure changes are written to persistent storage ***
+            print("[SettingsManager Debug] Calling Gio.Settings.sync()...") # DEBUG
+            Gio.Settings.sync() # This blocks until data is written.
+            print("[SettingsManager Debug] Gio.Settings.sync() completed.") # DEBUG
+
+        except GLib.Error as e:
+             print(f"Error: Could not set setting '{self.KEY_BREAK_INTERVAL}'. GError: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error: Unexpected error during set_break_interval: {e}", file=sys.stderr) # Catch other potential errors
+
+
+    # --- Added Methods for Idle Settings ---
+
+    def get_idle_monitor_enabled(self) -> bool:
+        """Retrieves whether the idle monitor is enabled."""
+        try:
+            return self.settings.get_boolean(self.KEY_IDLE_ENABLED)
+        except GLib.Error as e:
+            print(f"Warning: Could not get setting '{self.KEY_IDLE_ENABLED}'. Using default. GError: {e}", file=sys.stderr)
+            default_value = self.settings.get_default_value(self.KEY_IDLE_ENABLED)
+            return default_value.get_boolean() if default_value else True # Default to True
+
+    def set_idle_monitor_enabled(self, enabled: bool):
+        """Sets whether the idle monitor is enabled."""
+        print(f"[SettingsManager Debug] Attempting to set idle enabled to: {enabled}") # DEBUG
+        try:
+            success = self.settings.set_boolean(self.KEY_IDLE_ENABLED, bool(enabled))
+            print(f"[SettingsManager Debug] GSettings.set_boolean (idle_enabled) returned: {success}") # DEBUG
+            if not success:
+                 print(f"Warning: GSettings reported failure setting '{self.KEY_IDLE_ENABLED}'.", file=sys.stderr)
+            Gio.Settings.sync()
+            print("[SettingsManager Debug] Gio.Settings.sync() completed (after idle_enabled).") # DEBUG
+        except GLib.Error as e:
+             print(f"Error: Could not set setting '{self.KEY_IDLE_ENABLED}'. GError: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error: Unexpected error during set_idle_monitor_enabled: {e}", file=sys.stderr)
+
+
+    def get_idle_threshold_seconds(self) -> int:
+        """Retrieves the idle threshold in seconds."""
+        try:
+            # Ensure value is reasonable on read, min 10s
+            value = self.settings.get_uint(self.KEY_IDLE_THRESHOLD)
+            return max(10, value)
+        except GLib.Error as e:
+            print(f"Warning: Could not get setting '{self.KEY_IDLE_THRESHOLD}'. Using default. GError: {e}", file=sys.stderr)
+            default_value = self.settings.get_default_value(self.KEY_IDLE_THRESHOLD)
+            return default_value.get_uint32() if default_value else 120 # Default to 120
+
+    def set_idle_threshold_seconds(self, seconds: int):
+        """Sets the idle threshold in seconds."""
+        # Ensure minimum threshold (e.g., 10 seconds)
+        try:
+            validated_seconds = max(10, int(seconds))
+        except ValueError:
+             print(f"Warning: Invalid value '{seconds}' for idle threshold, using 10.", file=sys.stderr)
+             validated_seconds = 10
+
+        print(f"[SettingsManager Debug] Attempting to set idle threshold to: {validated_seconds}") # DEBUG
+        try:
+            success = self.settings.set_uint(self.KEY_IDLE_THRESHOLD, validated_seconds)
+            print(f"[SettingsManager Debug] GSettings.set_uint (idle_threshold) returned: {success}") # DEBUG
+            if not success:
+                 print(f"Warning: GSettings reported failure setting '{self.KEY_IDLE_THRESHOLD}'.", file=sys.stderr)
+            Gio.Settings.sync()
+            print("[SettingsManager Debug] Gio.Settings.sync() completed (after idle_threshold).") # DEBUG
+        except GLib.Error as e:
+             print(f"Error: Could not set setting '{self.KEY_IDLE_THRESHOLD}'. GError: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error: Unexpected error during set_idle_threshold_seconds: {e}", file=sys.stderr)
+
+
+# --- Test Code Block (Optional: Update to test new settings) ---
+if __name__ == '__main__':
+    print("Running basic SettingsManager test...")
+    try:
+        # Requires schema compiled first!
+        manager = SettingsManager()
+
+        # Test Interval
+        initial_interval = manager.get_break_interval()
+        print(f"Initial break interval: {initial_interval}")
+        manager.set_break_interval(15)
+        print(f"Set to 15, retrieved: {manager.get_break_interval()}")
+        manager.set_break_interval(initial_interval)
+        print(f"Reset to {initial_interval}, retrieved: {manager.get_break_interval()}")
+
+        # Test Idle Enabled
+        initial_idle_enabled = manager.get_idle_monitor_enabled()
+        print(f"\nInitial idle enabled: {initial_idle_enabled}")
+        manager.set_idle_monitor_enabled(not initial_idle_enabled)
+        print(f"Set to {not initial_idle_enabled}, retrieved: {manager.get_idle_monitor_enabled()}")
+        manager.set_idle_monitor_enabled(initial_idle_enabled)
+        print(f"Reset to {initial_idle_enabled}, retrieved: {manager.get_idle_monitor_enabled()}")
+
+        # Test Idle Threshold
+        initial_idle_threshold = manager.get_idle_threshold_seconds()
+        print(f"\nInitial idle threshold: {initial_idle_threshold}")
+        manager.set_idle_threshold_seconds(30)
+        print(f"Set to 30, retrieved: {manager.get_idle_threshold_seconds()}")
+        manager.set_idle_threshold_seconds(5) # Test minimum enforcement
+        print(f"Set to 5, retrieved: {manager.get_idle_threshold_seconds()} (should be >= 10)")
+        manager.set_idle_threshold_seconds(initial_idle_threshold)
+        print(f"Reset to {initial_idle_threshold}, retrieved: {manager.get_idle_threshold_seconds()}")
+
+        print("\nAll tests passed if retrieved values match set/reset values (and minimums enforced).")
+
+
+    except RuntimeError as e:
+        print(f"\nRuntimeError during test: {e}")
+        print("Ensure schema is compiled and accessible.")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred: {e}")
+
+
+
+===== FILE: ./requirements.txt =====
+playsound==1.2.2
+pycairo
+PyGObject
+
+
+
+
+===== FILE: ./mindful_break_app.py =====
+# File: mindful_break_app.py (Main Application - Updated)
+
+import sys
+import os
+import gi
+
+try:
+    # Ensure GTK 3, GLib, GObject, Gdk are available
+    gi.require_version('Gtk', '3.0')
+    gi.require_version('GLib', '2.0')
+    gi.require_version('GObject', '2.0')
+    gi.require_version('Gdk', '3.0')
+    # Check for AppIndicator/Ayatana
+    try:
+        gi.require_version('AyatanaAppIndicator3', '0.1')
+    except ValueError:
+        gi.require_version('AppIndicator3', '0.1')
+
+except ValueError as e:
+    print(f"Error: Could not satisfy Gtk/GLib/GObject/AppIndicator version requirements. {e}", file=sys.stderr)
+    sys.exit(1)
+
+from gi.repository import Gtk, GLib, GObject, Gio
+
+# Import all the components
+try:
+    from settings_manager import SettingsManager
+    from timer_manager import TimerManager
+    from idle_monitor import IdleMonitor
+    from tray_icon import TrayIcon
+    from settings_window import SettingsWindow # GTK3 version
+    from break_overlay import BreakOverlayWindow # GTK3 version
+    from sound_player import SoundPlayer # playsound version with block=True fix
+    from pause_duration_dialog import PauseDurationDialog # Import dialog
+except ImportError as e:
+     print(f"Error: Failed to import one or more application components. {e}", file=sys.stderr)
+     print("Ensure all .py files are present.")
+     sys.exit(1)
+
+# --- Constants ---
+APP_ID = "org.example.mindfulbreak"
+DEFAULT_SOUND_FILE = "notification.wav" # ** Update if needed **
+IDLE_POLL_INTERVAL_SECONDS = 30
+
+class MindfulBreakApp(Gtk.Application):
+    """
+    Main application class integrating all components for the break reminder.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(application_id=APP_ID,
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+                         **kwargs)
+
+        # Component Instances
+        self.settings_manager = None
+        self.timer_manager = None
+        self.idle_monitor = None
+        self.tray_icon = None
+        self.sound_player = None
+        self.settings_window = None
+        self.break_overlay_window = None
+
+        # State flags and variables
+        self._idle_monitor_enabled = True
+        self._idle_threshold_seconds = 120
+        self._paused_due_to_idle = False
+        self._manual_pause_timer_id = None
+        self._manual_pause_remaining_seconds = 0
+
+        self.connect("command-line", self.on_command_line)
+
+
+    def on_command_line(self, command_line, *args):
+        print("MindfulBreakApp: Command line signal received.")
+        self.activate()
+        return 0
+
+
+    def do_startup(self):
+        """Initialize components when the application first starts."""
+        Gtk.Application.do_startup(self)
+        print("MindfulBreakApp: Starting up...")
+
+        try:
+            self.settings_manager = SettingsManager(schema_id=APP_ID)
+
+            # --- Sound Player Setup ---
+            sound_path = DEFAULT_SOUND_FILE
+            if not os.path.isabs(sound_path):
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                sound_path = os.path.join(script_dir, DEFAULT_SOUND_FILE)
+            self.sound_player = SoundPlayer(sound_file_path=sound_path)
+
+            # --- Timer Manager Setup ---
+            self.timer_manager = TimerManager()
+            initial_interval = self.settings_manager.get_break_interval()
+            self.timer_manager.set_interval(initial_interval)
+
+            # --- Idle Monitor Setup (uses settings) ---
+            self.idle_monitor = None
+            self._idle_monitor_enabled = self.settings_manager.get_idle_monitor_enabled()
+            self._idle_threshold_seconds = self.settings_manager.get_idle_threshold_seconds()
+
+            if self._idle_monitor_enabled:
+                 print(f"Idle Monitor enabled, threshold: {self._idle_threshold_seconds}s. Initializing...")
+                 self.idle_monitor = IdleMonitor(idle_threshold_seconds=self._idle_threshold_seconds)
+                 if self.idle_monitor._initialized_successfully:
+                      self.idle_monitor.start(poll_interval_seconds=IDLE_POLL_INTERVAL_SECONDS)
+                 else:
+                      print("Warning: Idle monitor failed to initialize despite being enabled. Idle detection disabled.")
+                      self.idle_monitor = None
+            else:
+                 print("Idle Monitor disabled in settings.")
+
+            # --- Tray Icon Setup ---
+            self.tray_icon = TrayIcon(indicator_id=APP_ID + ".indicator")
+
+            # --- Connect signals ---
+            self._connect_signals()
+
+            print("MindfulBreakApp: Startup complete.")
+
+        except Exception as e:
+            print(f"FATAL ERROR during startup: {e}", file=sys.stderr)
+            self.quit()
+
+
+    def do_activate(self):
+        """Called when the application is activated."""
+        self.hold()
+        print("MindfulBreakApp: Holding application active.")
+
+        if self.tray_icon:
+            self.tray_icon.update_status(self.tray_icon.STATE_STOPPED)
+        print("MindfulBreakApp: Activated (running in background).")
+
+        # --- Auto-start Timer ---
+        print("MindfulBreakApp: Attempting auto-start...")
+        if self.settings_manager and self.timer_manager:
+            try:
+                self.on_start_timer_requested(None)
+                print("MindfulBreakApp: Auto-start initiated.")
+            except Exception as e:
+                 print(f"Error during auto-start: {e}", file=sys.stderr)
+                 if self.tray_icon:
+                      self.tray_icon.update_status(self.tray_icon.STATE_STOPPED)
+        else:
+             print("MindfulBreakApp: Cannot auto-start, components missing.")
+             if self.tray_icon:
+                  self.tray_icon.update_status(self.tray_icon.STATE_STOPPED)
+
+
+    def do_shutdown(self):
+        """Clean up resources when the application quits."""
+        if hasattr(self, 'get_is_busy') and self.get_is_busy():
+             print("MindfulBreakApp: Releasing hold during shutdown.")
+             self.release()
+
+        print("MindfulBreakApp: Shutting down...")
+        self._cancel_manual_pause()
+
+        if self.timer_manager:
+            self.timer_manager.stop()
+        if self.idle_monitor:
+            self.idle_monitor.stop()
+
+        if self.settings_window and hasattr(self.settings_window, 'is_destroyed') and not self.settings_window.is_destroyed():
+             print("MindfulBreakApp: Destroying settings window on shutdown.")
+             self.settings_window.destroy()
+        if self.break_overlay_window and hasattr(self.break_overlay_window, 'is_destroyed') and not self.break_overlay_window.is_destroyed():
+             print("MindfulBreakApp: Destroying overlay window on shutdown.")
+             self.break_overlay_window.destroy()
+
+        Gtk.Application.do_shutdown(self)
+        print("MindfulBreakApp: Shutdown complete.")
+
+
+    def _connect_signals(self):
+        """Connect signals from components to application handlers."""
+        if not self.timer_manager or not self.tray_icon:
+            print("Error: Cannot connect signals, components not initialized.", file=sys.stderr)
+            return
+
+        # --- Timer Manager Signals ---
+        self.timer_manager.connect('timer_tick', self.on_timer_tick)
+        self.timer_manager.connect('break_started', self.on_break_started)
+        self.timer_manager.connect('timer_paused', self.on_timer_paused)
+        self.timer_manager.connect('timer_resumed', self.on_timer_resumed)
+        self.timer_manager.connect('timer_stopped', self.on_timer_stopped)
+        self.timer_manager.connect('timer_started', self.on_timer_started)
+
+        # --- Idle Monitor Signals ---
+        if self.idle_monitor and self.idle_monitor._initialized_successfully:
+            self.idle_monitor.connect('user_idle', self.on_user_idle)
+            self.idle_monitor.connect('user_active', self.on_user_active)
+
+        # --- Tray Icon Signals ---
+        self.tray_icon.connect('start_timer_requested', self.on_start_timer_requested)
+        # self.tray_icon.connect('pause_timer_requested', self.on_pause_timer_requested) # REMOVED connection
+        self.tray_icon.connect('resume_timer_requested', self.on_resume_timer_requested)
+        self.tray_icon.connect('pause_for_requested', self.on_pause_for_requested)
+        self.tray_icon.connect('settings_requested', self.on_settings_requested)
+        self.tray_icon.connect('quit_requested', self.on_quit_requested)
+
+
+    # --- Signal Handler Methods ---
+
+    # --- Timer Handlers ---
+    def on_timer_tick(self, timer_manager, remaining_seconds):
+        if self.tray_icon and timer_manager.state == timer_manager.STATE_RUNNING:
+            self.tray_icon.update_status(self.tray_icon.STATE_RUNNING, remaining_seconds)
+
+    def on_break_started(self, timer_manager):
+        print("App: Break started.")
+        if self.sound_player:
+            self.sound_player.play_break_sound()
+        if self.tray_icon:
+            self.tray_icon.update_status(self.tray_icon.STATE_BREAK)
+
+        if self.break_overlay_window and hasattr(self.break_overlay_window, 'is_destroyed') and not self.break_overlay_window.is_destroyed():
+             print("App: Destroying previous overlay instance.")
+             self.break_overlay_window.destroy()
+
+        print("App: Creating new BreakOverlayWindow instance.")
+        self.break_overlay_window = BreakOverlayWindow()
+        print("App: Connecting overlay signals...")
+        self.break_overlay_window.connect('dismissed', self.on_overlay_dismissed)
+        self.break_overlay_window.connect('postponed', self.on_overlay_postponed)
+        self.break_overlay_window.connect('destroy', self.on_overlay_window_destroyed)
+        print("App: Showing overlay...")
+        self.break_overlay_window.show_and_start_elapsed_timer()
+
+    def on_timer_paused(self, timer_manager):
+        if self._manual_pause_timer_id:
+             return
+        if self.tray_icon:
+            if self._paused_due_to_idle:
+                self.tray_icon.update_status(self.tray_icon.STATE_IDLE)
+            else:
+                self.tray_icon.update_status(self.tray_icon.STATE_PAUSED)
+
+    def on_timer_resumed(self, timer_manager):
+        self._cancel_manual_pause()
+        self._paused_due_to_idle = False
+        if self.tray_icon:
+             self.tray_icon.update_status(self.tray_icon.STATE_RUNNING, timer_manager.remaining_seconds)
+
+    def on_timer_stopped(self, timer_manager):
+        self._cancel_manual_pause()
+        self._paused_due_to_idle = False
+        if self.tray_icon:
+            self.tray_icon.update_status(self.tray_icon.STATE_STOPPED)
+
+    def on_timer_started(self, timer_manager):
+         self._cancel_manual_pause() # Cancel manual pause on any start/restart/postpone
+         print(f"App: Timer started/postponed. Initial seconds: {timer_manager.remaining_seconds}")
+         self._paused_due_to_idle = False
+         if self.tray_icon:
+             # This call is correct - it passes the initial seconds
+             # The updated update_status method will now format it as MM:SS
+             self.tray_icon.update_status(self.tray_icon.STATE_RUNNING, timer_manager.remaining_seconds)
+
+    # --- Idle Handlers ---
+    def on_user_idle(self, idle_monitor):
+        print("App: User is idle.")
+        if self._manual_pause_timer_id:
+            print("App: Manual pause active, ignoring idle.")
+            return
+        if self.timer_manager and self.timer_manager.state == self.timer_manager.STATE_RUNNING:
+             print("App: Pausing timer due to idle.")
+             self._paused_due_to_idle = True
+             self.timer_manager.pause()
+
+    def on_user_active(self, idle_monitor):
+        print("App: User is active.")
+        if self._manual_pause_timer_id:
+             print("App: Manual pause active, ignoring user active for main timer.")
+             self._paused_due_to_idle = False
+             return
+        if self.timer_manager and self.timer_manager.state == self.timer_manager.STATE_PAUSED and self._paused_due_to_idle:
+             print("App: Resuming timer after idle period.")
+             self.timer_manager.resume()
+        elif self._paused_due_to_idle:
+             self._paused_due_to_idle = False
+
+    # --- Tray Menu Handlers ---
+    def on_start_timer_requested(self, tray_icon):
+        print("App: Start timer requested via tray.")
+        if not self.settings_manager or not self.timer_manager: return
+        interval = self.settings_manager.get_break_interval()
+        self.timer_manager.set_interval(interval)
+        self.timer_manager.start()
+
+    # on_pause_timer_requested method removed
+
+    def on_resume_timer_requested(self, tray_icon):
+        print("App: Resume timer requested via tray.")
+        if not self.timer_manager: return
+        self._cancel_manual_pause()
+        self._paused_due_to_idle = False
+        if self.timer_manager.state == self.timer_manager.STATE_PAUSED:
+            self.timer_manager.resume()
+
+    def on_pause_for_requested(self, tray_icon):
+        print("App: Pause for duration requested.")
+        if self.timer_manager is None: return
+        if self._manual_pause_timer_id:
+             print("App: Manual pause already active.")
+             return
+        # Sensitivity check in tray icon is primary guard
+        # if self.timer_manager.state != self.timer_manager.STATE_RUNNING:
+        #     print("App: Cannot 'Pause for...' when timer is not running.")
+        #     return
+
+        dialog = PauseDurationDialog(parent_window=None)
+        dialog.connect("response", self.on_pause_dialog_response)
+
+    def on_settings_requested(self, tray_icon):
+        print("App: Settings requested.")
+        if not self.settings_manager: return
+
+        if self.settings_window and hasattr(self.settings_window, 'is_destroyed') and not self.settings_window.is_destroyed():
+             print("App: Settings window already open, presenting.")
+             self.settings_window.present()
+             return
+
+        print("App: Creating settings window.")
+        self.settings_window = SettingsWindow(settings_manager=self.settings_manager)
+        self.settings_window.connect('settings_saved', self.on_settings_saved)
+        self.settings_window.connect('destroy', self.on_settings_window_destroyed)
+
+    def on_quit_requested(self, tray_icon):
+        """Handles the quit request from the tray icon."""
+        print("App: Quit requested via tray.")
+        if hasattr(self, 'get_is_busy') and self.get_is_busy():
+            self.release()
+        self.quit()
+
+    # --- Settings Window Handlers ---
+    def on_settings_saved(self, settings_window, new_interval):
+        print(f"App: Settings saved signal received. Main interval (for next cycle): {new_interval} minutes.")
+        if self.timer_manager:
+            self.timer_manager.set_interval(new_interval)
+            if self.timer_manager.state == self.timer_manager.STATE_STOPPED:
+                 if self.tray_icon:
+                      self.tray_icon.update_status(self.tray_icon.STATE_STOPPED)
+        self._update_idle_monitor_state() # Update idle monitor based on new settings
+
+    def on_settings_window_destroyed(self, widget):
+         print("App: Settings window destroyed.")
+         if self.settings_window == widget:
+              self.settings_window = None
+
+    # --- Overlay Window Handlers ---
+    def on_overlay_dismissed(self, overlay_window):
+        print("App: Handling overlay dismissal signal...")
+        if not self.settings_manager or not self.timer_manager: return
+        interval = self.settings_manager.get_break_interval()
+        self.timer_manager.set_interval(interval)
+        self.timer_manager.start()
+
+    def on_overlay_postponed(self, overlay_window, minutes):
+        print(f"App: Handling overlay postpone signal ({minutes} minutes)...")
+        if not self.timer_manager: return
+        # Convert minutes if necessary (postpone method expects float minutes)
+        self.timer_manager.postpone(float(minutes))
+
+    def on_overlay_window_destroyed(self, widget):
+        print("App: Break overlay window destroyed.")
+        if self.break_overlay_window == widget:
+            self.break_overlay_window = None
+
+    # --- Pause Dialog Handler ---
+    def on_pause_dialog_response(self, dialog, response_id):
+        duration_seconds = 0 # Get SECONDS from dialog method
+        if response_id == Gtk.ResponseType.OK:
+            duration_seconds = dialog.get_duration_seconds()
+            print(f"App: Pause dialog OK, duration: {duration_seconds}s")
+            if duration_seconds <= 0:
+                 print("App: Invalid duration, ignoring.")
+                 dialog.destroy()
+                 return
+        else:
+            print("App: Pause dialog cancelled.")
+            dialog.destroy()
+            return
+
+        dialog.destroy() # Destroy dialog before starting pause logic
+
+        self._paused_due_to_idle = False
+        if self.timer_manager.state == self.timer_manager.STATE_RUNNING:
+             self.timer_manager.pause()
+
+        self._manual_pause_remaining_seconds = duration_seconds
+        self._manual_pause_timer_id = GLib.timeout_add_seconds(1, self._manual_pause_tick)
+
+        if self.tray_icon:
+             self.tray_icon.update_status(self.tray_icon.STATE_MANUAL_PAUSE, self._manual_pause_remaining_seconds)
+
+    # --- Manual Pause Timer Logic ---
+    def _cancel_manual_pause(self):
+        """Stops the manual pause timer if it's active."""
+        if self._manual_pause_timer_id:
+            print("App: Cancelling manual pause timer.")
+            GLib.source_remove(self._manual_pause_timer_id)
+            self._manual_pause_timer_id = None
+            self._manual_pause_remaining_seconds = 0
+            if self.timer_manager and self.timer_manager.state == self.timer_manager.STATE_PAUSED:
+                 if self.tray_icon:
+                      self.on_timer_paused(self.timer_manager) # Restore visual state
+
+    def _manual_pause_tick(self):
+        """Callback for the temporary manual pause timer."""
+        if self._manual_pause_remaining_seconds <= 0:
+            print("Warning: Manual pause tick called with zero/negative time remaining.")
+            self._cancel_manual_pause() # Ensure timer ID is cleared
+            if self.timer_manager and self.timer_manager.state == self.timer_manager.STATE_PAUSED:
+                 print("App: Resuming main timer after manual pause finished (from tick).")
+                 self.timer_manager.resume()
+            return False # Stop this timer
+
+        self._manual_pause_remaining_seconds -= 1
+
+        if self.tray_icon:
+             self.tray_icon.update_status(self.tray_icon.STATE_MANUAL_PAUSE, self._manual_pause_remaining_seconds)
+
+        if self._manual_pause_remaining_seconds <= 0:
+            print("App: Manual pause duration finished.")
+            self._manual_pause_timer_id = None # Mark timer as stopped before resuming
+            if self.timer_manager and self.timer_manager.state == self.timer_manager.STATE_PAUSED:
+                 print("App: Resuming main timer after manual pause finished.")
+                 self.timer_manager.resume()
+            return False # Stop this timer
+        else:
+            return True # Continue this timer
+
+    # --- Helper to update idle monitor state ---
+    def _update_idle_monitor_state(self):
+        """Starts or stops the idle monitor based on current settings."""
+        if not self.settings_manager: return
+        new_enabled_state = self.settings_manager.get_idle_monitor_enabled()
+        new_threshold = self.settings_manager.get_idle_threshold_seconds()
+        print(f"Updating idle monitor state. New enabled={new_enabled_state}, threshold={new_threshold}")
+
+        if self.idle_monitor: # Check if monitor exists
+            # Check if settings actually changed relevant to monitor
+            needs_restart = (self._idle_monitor_enabled != new_enabled_state or
+                             (new_enabled_state and self._idle_threshold_seconds != new_threshold))
+
+            if needs_restart or not new_enabled_state:
+                print("Stopping existing idle monitor...")
+                self.idle_monitor.stop()
+                self.idle_monitor = None
+            else:
+                 print("Idle monitor settings unchanged, leaving monitor running.")
+                 return # No need to restart if only interval changed, for example
+
+        # Update internal state variables
+        self._idle_monitor_enabled = new_enabled_state
+        self._idle_threshold_seconds = new_threshold
+
+        if self._idle_monitor_enabled:
+             # Only create/start if needed (i.e., wasn't running or needs restart)
+             if self.idle_monitor is None:
+                 print(f"Starting idle monitor with threshold {self._idle_threshold_seconds}s...")
+                 self.idle_monitor = IdleMonitor(idle_threshold_seconds=self._idle_threshold_seconds)
+                 if self.idle_monitor._initialized_successfully:
+                     # Reconnect signals
+                     self.idle_monitor.connect('user_idle', self.on_user_idle)
+                     self.idle_monitor.connect('user_active', self.on_user_active)
+                     self.idle_monitor.start(poll_interval_seconds=IDLE_POLL_INTERVAL_SECONDS)
+                 else:
+                     print("Warning: Idle monitor failed to initialize. Idle detection disabled.")
+                     self.idle_monitor = None
+        else:
+            print("Idle monitor remains disabled.")
+            self._paused_due_to_idle = False
+
+
+# --- Main Execution ---
+if __name__ == '__main__':
+    print("Starting Mindful Break Application...")
+    app = MindfulBreakApp()
+    exit_status = app.run(sys.argv)
+    print("Application finished.")
+    sys.exit(exit_status)
+
+
+
+===== FILE: ./org.example.mindfulbreak.gschema.xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="mindfulbreak">
+  <schema id="org.example.mindfulbreak" path="/org/example/mindfulbreak/">
+    <key name="break-interval-minutes" type="u">
+      <default>25</default>
+      <summary>Default interval between breaks (minutes)</summary>
+      <description>The time in minutes the user wants between break reminders.</description>
+    </key>
+    <key name="idle-monitor-enabled" type="b">
+      <default>true</default>
+      <summary>Enable automatic pausing when idle</summary>
+      <description>Whether the timer should pause automatically if no user activity is detected.</description>
+    </key>
+    <key name="idle-threshold-seconds" type="u">
+      <default>120</default>
+      <summary>Idle time before pausing (seconds)</summary>
+      <description>The number of seconds of inactivity before the timer is automatically paused.</description>
+    </key>
+  </schema>
+</schemalist>
+
+
+
+===== FILE: ./tray_icon.py =====
+# File: tray_icon.py
+import sys
+import gi
+import math # For formatting time
+
+try:
+    # Use AyatanaAppIndicator3 if available (standard on modern Ubuntu/Debian)
+    gi.require_version('AyatanaAppIndicator3', '0.1')
+    use_ayatana = True
+except ValueError:
+    # Fallback to AppIndicator3
+    try:
+        print("AyatanaAppIndicator3 not found, falling back to AppIndicator3.", file=sys.stderr)
+        gi.require_version('AppIndicator3', '0.1')
+        use_ayatana = False
+    except ValueError:
+        print("Error: Neither AyatanaAppIndicator3 nor AppIndicator3 found.", file=sys.stderr)
+        print("Please install gir1.2-ayatanaappindicator3-0.1 (preferred) or gir1.2-appindicator3-0.1", file=sys.stderr)
+        sys.exit(1)
+
+# Import the correct module based on availability
+if use_ayatana:
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator3
+else:
+    from gi.repository import AppIndicator3
+
+# Require Gtk and GLib/GObject
+try:
+    gi.require_version('Gtk', '3.0') # AppIndicator usually works best with Gtk3 menus
+    gi.require_version('GObject', '2.0')
+    gi.require_version('GLib', '2.0')
+except ValueError as e:
+     print(f"Error: Could not satisfy Gtk/GObject/GLib version requirement. {e}", file=sys.stderr)
+     sys.exit(1)
+
+from gi.repository import Gtk, GObject, GLib
+
+class TrayIcon(GObject.Object):
+    """
+    Manages the system tray icon using AppIndicator library,
+    displaying timer status and providing a control menu.
+    Removed direct Pause option, uses Pause For... dialog.
+    """
+
+    # Define internal state constants
+    STATE_RUNNING = "RUNNING"
+    STATE_PAUSED = "PAUSED"       # Represents Idle or general paused state
+    STATE_IDLE = "IDLE"         # Specific state for display label if needed, but uses PAUSED icon/menu
+    STATE_BREAK = "BREAK_ACTIVE"
+    STATE_STOPPED = "STOPPED"
+    STATE_MANUAL_PAUSE = "MANUAL_PAUSE"
+
+    # Define standard icon names (or use custom ones)
+    ICON_DEFAULT = "preferences-system-time-symbolic"
+    ICON_RUNNING = "media-playback-start-symbolic"
+    ICON_PAUSED = "media-playback-pause-symbolic"
+    ICON_BREAK = "dialog-warning-symbolic" # Or 'user-idle-symbolic'
+
+    # Removed 'pause_timer_requested' signal
+    __gsignals__ = {
+        'start_timer_requested': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        # 'pause_timer_requested': (GObject.SignalFlags.RUN_FIRST, None, ()), # REMOVED
+        'resume_timer_requested': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'pause_for_requested': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'settings_requested': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'quit_requested': (GObject.SignalFlags.RUN_FIRST, None, ()),
+    }
+
+    def __init__(self, indicator_id: str):
+        """
+        Initializes the TrayIcon.
+
+        Args:
+            indicator_id: A unique ID for the application indicator.
+        """
+        GObject.Object.__init__(self)
+
+        self.indicator = AppIndicator3.Indicator.new(
+            indicator_id,
+            self.ICON_DEFAULT,
+            AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
+
+        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+
+        # Build the menu
+        self.menu = Gtk.Menu()
+
+        # --- Dynamic Item (Start/Resume/Start New) ---
+        # This item no longer shows "Pause Timer"
+        self.item_start_resume = Gtk.MenuItem(label="Start Timer")
+        self.item_start_resume.connect('activate', self._on_start_resume_activate)
+        self.menu.append(self.item_start_resume)
+        self._current_dynamic_action = 'start' # Tracks what this item does
+
+        # --- Pause For... Item ---
+        self.item_pause_for = Gtk.MenuItem(label="Pause for...")
+        self.item_pause_for.connect('activate', self._on_pause_for_activate)
+        self.menu.append(self.item_pause_for)
+
+        # --- Separator ---
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        # --- Settings ---
+        item_settings = Gtk.MenuItem(label="Settings")
+        item_settings.connect('activate', self._on_settings_activate)
+        self.menu.append(item_settings)
+
+        # --- Quit ---
+        item_quit = Gtk.MenuItem(label="Quit")
+        item_quit.connect('activate', self._on_quit_activate)
+        self.menu.append(item_quit)
+
+        self.menu.show_all()
+        self.indicator.set_menu(self.menu)
+
+        # Set initial visual state
+        self.update_status(self.STATE_STOPPED)
+
+        print(f"TrayIcon: Initialized with ID '{indicator_id}'")
+
+
+    def update_status(self, state: str, remaining_seconds: int = 0):
+        """
+        Updates the indicator icon and label based on the provided state.
+        Now always shows MM:SS when running.
+
+        Args:
+            state: The current state (use STATE_* constants).
+            remaining_seconds: Time left, used when state is RUNNING or MANUAL_PAUSE.
+        """
+        label = "MindfulBreak" # Default label
+        icon_name = self.ICON_DEFAULT
+        dynamic_label = "Start Timer"
+        dynamic_action = "start"
+        dynamic_sensitive = True
+        pause_for_sensitive = False # "Pause for..." only available when running
+
+        if state == self.STATE_RUNNING:
+            minutes = remaining_seconds // 60
+            seconds = remaining_seconds % 60
+            # --- Change: Always format as MM:SS ---
+            label = f"{minutes:02d}:{seconds:02d} left"
+            # --- End Change ---
+            icon_name = self.ICON_RUNNING
+            # Option 2: Disable the dynamic item when running
+            dynamic_label = "Running..." # Display only, not clickable
+            dynamic_action = "none"      # Custom action type
+            dynamic_sensitive = False    # Disable it
+            pause_for_sensitive = True   # Enable "Pause for..." when running
+
+        elif state == self.STATE_PAUSED:
+            label = "Paused"
+            icon_name = self.ICON_PAUSED
+            dynamic_label = "Resume Timer"
+            dynamic_action = "resume"
+
+        elif state == self.STATE_IDLE:
+            label = "Paused (Idle)"
+            icon_name = self.ICON_PAUSED
+            dynamic_label = "Resume Timer"
+            dynamic_action = "resume"
+
+        elif state == self.STATE_BREAK:
+            label = "Break Time!"
+            icon_name = self.ICON_BREAK
+            dynamic_label = "Start New Timer" # Start after break
+            dynamic_action = "start"
+
+        elif state == self.STATE_STOPPED:
+            label = "Stopped"
+            icon_name = self.ICON_DEFAULT
+            dynamic_label = "Start Timer"
+            dynamic_action = "start"
+
+        elif state == self.STATE_MANUAL_PAUSE:
+             minutes = remaining_seconds // 60
+             seconds = remaining_seconds % 60
+             # --- Change: Format manual pause as MM:SS too ---
+             label = f"Paused for {minutes:02d}:{seconds:02d}"
+             # --- End Change ---
+             icon_name = self.ICON_PAUSED
+             dynamic_label = "Resume Now" # Allow manual resume
+             dynamic_action = "resume"
+
+        else:
+             print(f"Warning: Unknown state '{state}' in update_status.", file=sys.stderr)
+
+        # Apply updates (remains same)
+        self.indicator.set_label(label, "")
+        self.indicator.set_icon_full(icon_name, label)
+
+        self.item_start_resume.set_label(dynamic_label)
+        self.item_start_resume.set_sensitive(dynamic_sensitive)
+        self._current_dynamic_action = dynamic_action
+
+        self.item_pause_for.set_sensitive(pause_for_sensitive)
+
+        # print(f"TrayIcon: Updated - State={state}, Label='{label}', Icon='{icon_name}', DynAction='{dynamic_action}'")
+
+    # --- Signal Emitters for Menu Actions ---
+    def _on_start_resume_activate(self, widget):
+        """Callback for the dynamic start/resume menu item."""
+        if self._current_dynamic_action == "start":
+            print("TrayIcon: Start action requested.")
+            self.emit('start_timer_requested')
+        elif self._current_dynamic_action == "resume":
+            print("TrayIcon: Resume action requested.")
+            self.emit('resume_timer_requested')
+        elif self._current_dynamic_action == "none":
+             # Action when item is disabled (e.g., "Running...")
+             pass
+        else:
+             print(f"TrayIcon: Unknown dynamic action '{self._current_dynamic_action}'")
+
+    def _on_pause_for_activate(self, widget):
+        print("TrayIcon: Pause for... action requested.")
+        self.emit('pause_for_requested')
+
+    def _on_settings_activate(self, widget):
+        print("TrayIcon: Settings action requested.")
+        self.emit('settings_requested')
+
+    def _on_quit_activate(self, widget):
+        print("TrayIcon: Quit action requested.")
+        self.emit('quit_requested')
+
+
+# --- Test Code (Minimal - uncomment and adapt if needed) ---
+if __name__ == '__main__':
+    print("Running TrayIcon Test...")
+    print("This test code is minimal. Run the main application for full testing.")
+    # Example of how to test the new state manually:
+    # try:
+    #     Gtk.init(None)
+    #     tray = TrayIcon('test.indicator')
+    #     def test_manual_pause():
+    #         print("TEST: Setting manual pause state for 15s")
+    #         tray.update_status(tray.STATE_MANUAL_PAUSE, 15)
+    #         return False
+    #     def test_running():
+    #          print("TEST: Setting running state")
+    #          tray.update_status(tray.STATE_RUNNING, 120)
+    #          return False
+    #
+    #     GLib.timeout_add_seconds(5, test_running)
+    #     GLib.timeout_add_seconds(10, test_manual_pause)
+    #     Gtk.main()
+    # except Exception as e:
+    #     print(f"Error: {e}")
+
+    pass # Keep python interpreter running if run directly without main loop
+
+
+
+===== FILE: ./setup.sh =====
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status.
+set -e
+
+# --- Configuration ---
+ENV_NAME="mindfulbreaks"
+PYTHON_VERSION="3.11" # Or choose another supported version
+CONDA_CHANNEL="conda-forge"
+# Conda packages - Python, Pip, PyGObject, GTK/GLib runtime libs, build tools
+CONDA_REQUIREMENTS=(
+    "python=$PYTHON_VERSION"
+    "pip"
+    "pygobject"
+    "gtk3"
+    "glib"
+    "c-compiler"
+    "cxx-compiler"
+    "make"
+    "pkg-config"
+)
+PIP_REQUIREMENTS=(
+    "playsound==1.2.2"
+)
+# System apt packages - ONLY C/C++ Runtime Libs & Introspection Data
+APT_REQUIREMENTS=(
+    # Introspection Data (Crucial for PyGObject bindings)
+    "gir1.2-glib-2.0"
+    "gir1.2-gtk-3.0"
+    "gir1.2-ayatanaappindicator3-0.1"
+    # Runtime C Libraries for Indicators & Idle
+    "libayatana-appindicator3-1"
+    "libdbusmenu-glib4"
+    "libdbusmenu-gtk3-4"
+    "libxss1"
+    # GSettings Backend
+    "dconf-gsettings-backend"
+    # Potential Runtime Dependencies for GStreamer (used by playsound/GTK)
+    "gstreamer1.0-plugins-base"
+    "gstreamer1.0-plugins-good"
+)
+GSETTINGS_SCHEMA_ID="org.example.mindfulbreak"
+GSETTINGS_XML_FILENAME="${GSETTINGS_SCHEMA_ID}.gschema.xml"
+SOUND_FILE="notification.wav"
+
+# --- Helper Functions ---
+print_info() {
+    echo "INFO: $1"
+}
+print_warning() {
+    echo "WARN: $1"
+}
+print_error() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# --- Check Prerequisites ---
+print_info "Checking prerequisites..."
+if ! command_exists conda; then
+    print_error "Conda command not found. Please install Miniconda or Anaconda and initialize it."
+fi
+if [ ! -f "$SOUND_FILE" ]; then
+    print_warning "Sound file '$SOUND_FILE' not found in current directory. Sound playback will fail."
+    print_warning "Please place a suitable .wav or .mp3 file named '$SOUND_FILE' here."
+fi
+if [ ! -f "mindful_break_app.py" ]; then
+    print_error "Main script 'mindful_break_app.py' not found. Run this script from your project directory."
+fi
+print_info "Prerequisites check passed."
+
+# --- Create/Update Conda Environment ---
+print_info "Checking for Conda environment '$ENV_NAME'..."
+if conda env list | grep -q "^${ENV_NAME}\s"; then
+    print_info "Conda environment '$ENV_NAME' already exists. Ensuring packages..."
+    conda install -y -n "$ENV_NAME" -c "$CONDA_CHANNEL" --file <(printf "%s\n" "${CONDA_REQUIREMENTS[@]}")
+else
+    print_info "Creating Conda environment '$ENV_NAME'..."
+    conda create -y -n "$ENV_NAME" -c "$CONDA_CHANNEL" --file <(printf "%s\n" "${CONDA_REQUIREMENTS[@]}")
+    print_info "Conda environment created."
+fi
+
+# --- Install System (apt) Dependencies (Non-Python) ---
+# These provide the C libraries and introspection data needed at runtime
+print_info "Updating apt package list..."
+sudo apt update
+print_info "Installing required system libraries and introspection data via apt..."
+req_string=$(printf "%s " "${APT_REQUIREMENTS[@]}" | xargs)
+if [ -n "$req_string" ]; then
+    sudo apt install -y --no-install-recommends $req_string # Use --no-install-recommends
+    print_info "System packages installed."
+else
+    print_info "No system packages specified via apt."
+fi
+
+# --- Install Pip Dependencies ---
+print_info "Installing Python packages via pip into '$ENV_NAME' environment..."
+pip_install_cmd="pip install"
+for pkg in "${PIP_REQUIREMENTS[@]}"; do
+    pip_install_cmd+=" '$pkg'"
+done
+conda run -n "$ENV_NAME" bash -c "$pip_install_cmd"
+print_info "Pip packages installed."
+
+# --- Setup GSettings Schema ---
+print_info "Setting up GSettings schema..."
+SCHEMA_DIR="$HOME/.local/share/glib-2.0/schemas"
+mkdir -p "$SCHEMA_DIR"
+print_info "Creating schema file '$GSETTINGS_XML_FILENAME'..."
+
+cat << EOF > "$GSETTINGS_XML_FILENAME"
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="mindfulbreak">
+  <schema id="${GSETTINGS_SCHEMA_ID}" path="/org/example/mindfulbreak/">
+    <key name="break-interval-minutes" type="u">
+      <default>25</default>
+      <summary>Default interval between breaks (minutes)</summary>
+      <description>The time in minutes the user wants between break reminders.</description>
+    </key>
+    <key name="idle-monitor-enabled" type="b">
+      <default>true</default>
+      <summary>Enable automatic pausing when idle</summary>
+      <description>Whether the timer should pause automatically if no user activity is detected.</description>
+    </key>
+    <key name="idle-threshold-seconds" type="u">
+      <default>120</default>
+      <summary>Idle time before pausing (seconds)</summary>
+      <description>The number of seconds of inactivity before the timer is automatically paused.</description>
+    </key>
+  </schema>
+</schemalist>
+EOF
+
+print_info "Copying schema to '$SCHEMA_DIR'..."
+cp "$GSETTINGS_XML_FILENAME" "$SCHEMA_DIR/"
+
+print_info "Compiling user GSettings schemas..."
+# Use system glib-compile-schemas as it's reliably present
+if command_exists glib-compile-schemas; then
+     glib-compile-schemas "$SCHEMA_DIR"
+else
+     print_warning "System 'glib-compile-schemas' not found. GSettings might not work."
+fi
+print_info "GSettings schema setup complete."
+
+# --- Setup Environment Variable for Conda Env (Needed Again) ---
+# Because APT installs introspection data system-wide, the Conda PyGObject
+# needs to be told where to find it in addition to its own path.
+print_info "Setting up GI_TYPELIB_PATH for Conda environment '$ENV_NAME'..."
+CONDA_BASE=$(conda info --base)
+if [ -z "$CONDA_BASE" ]; then
+    print_error "Could not determine Conda base directory."
+fi
+CONDA_PREFIX_PATH="$CONDA_BASE/envs/$ENV_NAME"
+if [ ! -d "$CONDA_PREFIX_PATH" ]; then
+    print_error "Could not find Conda environment path at '$CONDA_PREFIX_PATH'."
+fi
+
+SYSTEM_TYPELIB_PATH="/usr/lib/x86_64-linux-gnu/girepository-1.0" # Adjust if needed
+if [ ! -d "$SYSTEM_TYPELIB_PATH" ]; then
+     print_warning "System typelib path '$SYSTEM_TYPELIB_PATH' not found. Indicator might not work."
+     GI_TYPELIB_VALUE="$CONDA_PREFIX_PATH/lib/girepository-1.0" # Only use conda path
+else
+     # Combine paths: Conda Env Path + System Path
+     GI_TYPELIB_VALUE="$CONDA_PREFIX_PATH/lib/girepository-1.0:$SYSTEM_TYPELIB_PATH"
+fi
+
+# Create activation script
+ACTIVATE_DIR="$CONDA_PREFIX_PATH/etc/conda/activate.d"
+mkdir -p "$ACTIVATE_DIR"
+ACTIVATE_SCRIPT="$ACTIVATE_DIR/env_vars.sh"
+# Use improved script to handle pre-existing values
+echo 'if [ -n "$GI_TYPELIB_PATH" ]; then' > "$ACTIVATE_SCRIPT"
+echo '  export _CONDA_SET_GI_TYPELIB_PATH="$GI_TYPELIB_PATH"' >> "$ACTIVATE_SCRIPT"
+echo 'fi' >> "$ACTIVATE_SCRIPT"
+echo "export GI_TYPELIB_PATH=\"$GI_TYPELIB_VALUE:\$GI_TYPELIB_PATH\"" >> "$ACTIVATE_SCRIPT"
+print_info "Created activation script: $ACTIVATE_SCRIPT"
+
+# Create deactivation script
+DEACTIVATE_DIR="$CONDA_PREFIX_PATH/etc/conda/deactivate.d"
+mkdir -p "$DEACTIVATE_DIR"
+DEACTIVATE_SCRIPT="$DEACTIVATE_DIR/env_vars.sh"
+echo 'if [ -n "$_CONDA_SET_GI_TYPELIB_PATH" ]; then' > "$DEACTIVATE_SCRIPT"
+echo '  export GI_TYPELIB_PATH="$_CONDA_SET_GI_TYPELIB_PATH"' >> "$DEACTIVATE_SCRIPT"
+echo '  unset _CONDA_SET_GI_TYPELIB_PATH' >> "$DEACTIVATE_SCRIPT"
+echo 'else' >> "$DEACTIVATE_SCRIPT"
+echo '  # If original was empty or unset, unset it on deactivate' >> "$DEACTIVATE_SCRIPT"
+echo '  unset GI_TYPELIB_PATH' >> "$DEACTIVATE_SCRIPT"
+echo 'fi' >> "$DEACTIVATE_SCRIPT"
+print_info "Created deactivation script: $DEACTIVATE_SCRIPT"
+print_info "GI_TYPELIB_PATH setup complete."
+
+# --- Finished ---
+print_info ""
+print_info "-----------------------------------------------------"
+print_info "MindfulBreak Environment Setup Complete!"
+print_info "-----------------------------------------------------"
+print_info "To run the application:"
+print_info "1. Deactivate and Reactivate the environment if already active:"
+print_info "   conda deactivate"
+print_info "   conda activate $ENV_NAME"
+print_info "2. Run the main script: python mindful_break_app.py"
+print_info "-----------------------------------------------------"
+if [ ! -f "$SOUND_FILE" ]; then
+    print_warning "Remember to place '$SOUND_FILE' in the current directory for sound notifications."
+fi
+echo ""
+
+exit 0
+
+
+
+===== FILE: ./sound_player.py =====
+import sys
+import os
+from playsound import playsound, PlaysoundException
+
+class SoundPlayer:
+    """
+    A simple utility class to play a notification sound using the 'playsound' library.
+    """
+
+    def __init__(self, sound_file_path: str):
+        """
+        Initializes the SoundPlayer.
+
+        Args:
+            sound_file_path: The path to the sound file (e.g., .wav, .mp3).
+        """
+        self.sound_file_path = sound_file_path
+        self._verify_file()
+
+    def _verify_file(self):
+        """Checks if the sound file exists and is readable."""
+        if not os.path.exists(self.sound_file_path):
+            print(f"Warning: Sound file not found at '{self.sound_file_path}'. Playback will fail.", file=sys.stderr)
+            # Optional: Raise an error instead? For now, just warn.
+            # raise FileNotFoundError(f"Sound file not found: {self.sound_file_path}")
+        elif not os.path.isfile(self.sound_file_path):
+            print(f"Warning: Path '{self.sound_file_path}' is not a file. Playback will fail.", file=sys.stderr)
+        elif not os.access(self.sound_file_path, os.R_OK):
+             print(f"Warning: Sound file at '{self.sound_file_path}' is not readable. Playback might fail.", file=sys.stderr)
+
+
+    def play_break_sound(self):
+        """
+        Plays the configured sound file synchronously (blocking).
+        Includes basic error handling.
+        """
+        if not os.path.exists(self.sound_file_path) or not os.path.isfile(self.sound_file_path):
+             print(f"Error: Cannot play sound, file not found or not a file: '{self.sound_file_path}'", file=sys.stderr)
+             return
+
+        print(f"SoundPlayer: Attempting to play '{self.sound_file_path}' (blocking)...")
+        try:
+            # Set block=True (or omit it, as True is often the default)
+            playsound(self.sound_file_path, block=True)
+            print(f"SoundPlayer: Playback finished for '{self.sound_file_path}'.")
+        except PlaysoundException as e:
+            print(f"Error: Failed to play sound '{self.sound_file_path}'. PlaysoundException: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error: An unexpected error occurred during sound playback: {e}", file=sys.stderr)
+
+# --- Test Code ---
+if __name__ == '__main__':
+    print("Running SoundPlayer Test...")
+
+    # *** IMPORTANT: Replace 'notification.wav' with the actual path to YOUR sound file ***
+    # If it's in the same directory, just the filename is fine.
+    # Otherwise, use the full path like '/home/george/Sounds/my_alert.mp3'
+    sound_file = "notification.wav" # <-- CHANGE THIS AS NEEDED
+
+    if not os.path.exists(sound_file):
+        print(f"\nERROR: Test sound file '{sound_file}' not found in the current directory.")
+        print("Please download a .wav or .mp3 file, save it here as 'notification.wav', or update the 'sound_file' variable in this script.")
+        sys.exit(1)
+
+    try:
+        player = SoundPlayer(sound_file_path=sound_file)
+
+        print("\nAttempting to play the sound...")
+        player.play_break_sound()
+
+        # Since playback is asynchronous (block=False), add a small delay
+        # in the test script to give the sound time to actually play before exiting.
+        # In the real application, the main loop will keep running anyway.
+        print("Waiting a few seconds for sound to play (playback is async)...")
+        import time
+        try:
+            time.sleep(3) # Wait for 3 seconds
+        except KeyboardInterrupt:
+            print("\nSleep interrupted.")
+
+        print("\nTesting with a non-existent file path:")
+        non_existent_file = "no_such_sound_exists_here.wav"
+        try:
+            player_bad = SoundPlayer(non_existent_file) # Should print warning
+            player_bad.play_break_sound() # Should print error
+        except FileNotFoundError:
+             print("(Successfully caught FileNotFoundError during init - if raised)")
+
+
+    except ImportError:
+         print("\nError: Could not import the 'playsound' library.")
+         print("Please install it: pip install playsound==1.2.2")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred during the test: {e}")
+
+    print("\n--- Test End ---")
+
+
+
+===== FILE: ./pause_duration_dialog.py =====
+# File: pause_duration_dialog.py
+import sys
+import gi
+try:
+    gi.require_version('Gtk', '3.0')
+except ValueError as e:
+    print(f"Error: Could not satisfy Gtk version requirement (3.0). {e}", file=sys.stderr)
+    # This might be non-fatal if dialog isn't used, but better to know.
+    # sys.exit(1) # Or just let it fail later
+
+from gi.repository import Gtk
+
+class PauseDurationDialog(Gtk.Dialog):
+    """
+    A simple dialog to get a pause duration (in minutes) from the user.
+    """
+    def __init__(self, parent_window=None): # Make parent optional
+        super().__init__(title="Pause Timer", transient_for=parent_window, flags=0)
+        self.add_buttons(
+            # Use standard GTK stock IDs
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OK, Gtk.ResponseType.OK
+        )
+
+        self.set_modal(True)
+        self.set_default_size(300, 100)
+        self.set_border_width(10)
+        self.set_position(Gtk.WindowPosition.CENTER) # Center it
+
+        content_area = self.get_content_area() # Box GtkDialog uses
+
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        # Set margins for the hbox within the content area
+        hbox.set_margin_top(10)
+        hbox.set_margin_bottom(10)
+        hbox.set_margin_start(5)
+        hbox.set_margin_end(5)
+        content_area.pack_start(hbox, True, True, 0) # Fill horizontally
+
+        # --- Label Changed ---
+        label = Gtk.Label(label="Pause duration (minutes):")
+        label.set_xalign(0) # Align left
+        hbox.pack_start(label, False, False, 0) # Don't expand label
+
+        self.spin_duration = Gtk.SpinButton()
+        # --- Adjustment Changed for Minutes ---
+        adjustment = Gtk.Adjustment(
+            value=5,     # Default 5 minutes
+            lower=1,     # Min 1 minute
+            upper=60,    # Max 1 hour (in minutes)
+            step_increment=1, # Step by 1 min
+            page_increment=5, # Page up/down by 5 mins
+            page_size=0
+        )
+        self.spin_duration.set_adjustment(adjustment)
+        self.spin_duration.set_digits(0) # No decimal places for minutes
+        self.spin_duration.set_numeric(True)
+        hbox.pack_start(self.spin_duration, True, True, 0) # Expand spin button
+
+        # Set OK button as default response on Enter
+        ok_button = self.get_widget_for_response(Gtk.ResponseType.OK)
+        if ok_button:
+            ok_button.set_can_default(True)
+            ok_button.grab_default()
+
+        self.spin_duration.grab_focus() # Focus input field
+        self.show_all()
+
+    def get_duration_seconds(self):
+        """Returns the selected duration converted to seconds."""
+        # --- Conversion Added ---
+        try:
+            minutes = self.spin_duration.get_value_as_int()
+        except Exception: # Catch potential errors if value is weird somehow
+             minutes = 0
+        # Ensure minimum of 1 minute? No, allow <1 min if user types it, converted below.
+        # The adjustment lower bound handles the spin button itself.
+        return max(1, minutes * 60) # Return seconds, minimum 1 sec
+
+# --- Test Code ---
+if __name__ == '__main__':
+    print("Running PauseDurationDialog Test (Minutes Input)...")
+    try: Gtk.init_check()
+    except Exception: Gtk.init(None)
+
+    dialog = PauseDurationDialog()
+    response = dialog.run() # Blocks until dialog responds
+
+    if response == Gtk.ResponseType.OK:
+        # Get minutes from spin button directly for display
+        minutes_entered = dialog.spin_duration.get_value_as_int()
+        # Get calculated seconds using the method
+        duration_seconds = dialog.get_duration_seconds()
+        print(f"Dialog OK, duration selected: {minutes_entered} minutes ({duration_seconds} seconds)")
+    elif response == Gtk.ResponseType.CANCEL or response == Gtk.ResponseType.DELETE_EVENT:
+         print("Dialog Cancelled or Closed.")
+    else:
+         print(f"Dialog returned unexpected response: {response}")
+
+    dialog.destroy()
+    print("Test finished.")
+
+
+
+===== FILE: ./break_overlay.py =====
+# File: break_overlay.py (GTK3 Version - Corrected Signal Emission & Dismiss Delay)
+import sys
+import gi
+import time # Only for test delay
+
+try:
+    gi.require_version('Gtk', '3.0')
+    gi.require_version('GLib', '2.0')
+    gi.require_version('GObject', '2.0')
+    gi.require_version('Gdk', '3.0') # Needed for Screen, Button constants
+except ValueError as e:
+    print(f"Error: Could not satisfy Gtk/GLib/GObject/Gdk version requirements. {e}", file=sys.stderr)
+    sys.exit(1)
+
+from gi.repository import Gtk, GLib, GObject, Gdk
+
+class BreakOverlayWindow(Gtk.Window): # Inherit from Gtk.Window
+    """
+    A fullscreen, semi-transparent overlay window displayed during break time (GTK3).
+    Shows elapsed break time and offers postpone options.
+    Includes a 3-second delay before background clicks dismiss the window.
+    """
+
+    __gsignals__ = {
+        'dismissed': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'postponed': (GObject.SignalFlags.RUN_FIRST, None, (int,)), # Emits postpone minutes
+    }
+
+    # Delay before background click works (in seconds)
+    DISMISS_DELAY_SECONDS = 3
+
+    def __init__(self, **kwargs):
+        """Initializes the BreakOverlayWindow."""
+        super().__init__(**kwargs)
+
+        self._elapsed_seconds = 0
+        self._elapsed_timer_id = None
+        self._can_dismiss_background = False # Flag to control background dismissal
+        self._dismiss_delay_timer_id = None  # Timer ID for the dismiss delay
+
+        self.set_title("MindfulBreak - Take a Break!")
+        self.set_decorated(False)
+        self.fullscreen()
+        self.set_keep_above(True)
+
+        # Set opacity (Ignoring deprecation warning)
+        try:
+            self.set_opacity(0.75)
+        except AttributeError:
+             print("Warning: set_opacity not available.", file=sys.stderr)
+
+        # --- EventBox for background click detection ---
+        self.event_box = Gtk.EventBox()
+        self.add(self.event_box)
+        self.event_box.get_style_context().add_class("overlay-eventbox")
+        self.event_box.connect("button-press-event", self._on_background_button_press)
+
+        # --- Main Layout Box (Inside the EventBox) ---
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        main_box.set_vexpand(True)
+        main_box.set_hexpand(True)
+        main_box.set_valign(Gtk.Align.CENTER)
+        main_box.set_halign(Gtk.Align.CENTER)
+        self.event_box.add(main_box)
+
+        # --- Content Box (to group labels and buttons) ---
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        content_box.set_valign(Gtk.Align.CENTER)
+        content_box.set_halign(Gtk.Align.CENTER)
+        main_box.pack_start(content_box, False, False, 0)
+
+        # --- Main Label ---
+        lbl_title = Gtk.Label()
+        lbl_title.set_markup("<span size='xx-large' weight='bold'>Time for a break!</span>")
+        lbl_title.get_style_context().add_class("overlay-title")
+        content_box.pack_start(lbl_title, False, False, 0)
+
+        # --- Elapsed Time Label ---
+        self.lbl_elapsed_time = Gtk.Label(label="Break started: 00:00")
+        self.lbl_elapsed_time.get_style_context().add_class("overlay-elapsed")
+        content_box.pack_start(self.lbl_elapsed_time, False, False, 0)
+
+        # --- Button Box ---
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=15)
+        button_box.set_halign(Gtk.Align.CENTER)
+        content_box.pack_start(button_box, False, False, 15)
+
+        # --- Postpone Buttons ---
+        btn_postpone_5 = Gtk.Button(label="Postpone 5 min")
+        btn_postpone_5.connect('clicked', self._on_postpone_clicked, 5)
+        btn_postpone_5.get_style_context().add_class("overlay-button")
+        button_box.pack_start(btn_postpone_5, False, False, 0)
+
+        btn_postpone_10 = Gtk.Button(label="Postpone 10 min")
+        btn_postpone_10.connect('clicked', self._on_postpone_clicked, 10)
+        btn_postpone_10.get_style_context().add_class("overlay-button")
+        button_box.pack_start(btn_postpone_10, False, False, 0)
+
+        # --- Apply CSS ---
+        self._apply_css()
+
+        print("BreakOverlayWindow (GTK3): Initialized.")
+
+
+    def _apply_css(self):
+        """Applies custom CSS for styling the overlay."""
+        provider = Gtk.CssProvider()
+        css = """
+        /* Target the event box using its CSS class */
+        .overlay-eventbox {
+            background-color: rgba(30, 30, 30, 0.85);
+        }
+        .overlay-eventbox label {
+            color: white;
+            text-shadow: 1px 1px 2px black;
+            background-color: transparent;
+        }
+        label.overlay-title { font-size: 24pt; }
+        label.overlay-elapsed { font-size: 16pt; }
+        .overlay-eventbox button {
+            font-size: 12pt; padding: 8px 16px; margin: 15px;
+            border-radius: 5px; background-image: none; background-color: #555;
+            color: white; border: 1px solid #777;
+            box-shadow: 1px 1px 3px rgba(0,0,0,0.4);
+        }
+        .overlay-eventbox button:hover { background-color: #666; }
+        .overlay-eventbox button:active { background-color: #444; }
+        """
+        try:
+            provider.load_from_data(css.encode('utf-8'))
+        except GLib.Error as e:
+            print(f"CSS Loading Error: {e}", file=sys.stderr)
+            return
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+    def show_and_start_elapsed_timer(self):
+        """Makes the window visible, starts elapsed timer, and starts dismiss delay timer."""
+        print("BreakOverlayWindow: Showing and starting timers.")
+        self._elapsed_seconds = 0
+        self._update_elapsed_label()
+
+        # --- Start/Reset Dismiss Delay ---
+        self._can_dismiss_background = False # Disable initially
+        # Cancel previous delay timer if somehow active
+        if self._dismiss_delay_timer_id:
+            GLib.source_remove(self._dismiss_delay_timer_id)
+        # Start new delay timer
+        print(f"BreakOverlayWindow: Starting {self.DISMISS_DELAY_SECONDS}s dismiss delay timer.")
+        self._dismiss_delay_timer_id = GLib.timeout_add_seconds(
+            self.DISMISS_DELAY_SECONDS,
+            self._enable_background_dismiss
+        )
+        # --------------------------------
+
+        # Ensure previous elapsed timer is stopped if any
+        if self._elapsed_timer_id:
+            GLib.source_remove(self._elapsed_timer_id)
+        # Start elapsed timer
+        self._elapsed_timer_id = GLib.timeout_add_seconds(1, self._update_elapsed_timer)
+
+        self.show_all()
+
+
+    def _enable_background_dismiss(self):
+        """Callback for the dismiss delay timer."""
+        print("BreakOverlayWindow: Dismiss delay ended. Background clicks enabled.")
+        self._can_dismiss_background = True
+        self._dismiss_delay_timer_id = None # Timer finished, clear ID
+        return GLib.SOURCE_REMOVE # Stop this timer (same as returning False)
+
+
+    def hide_and_stop_elapsed_timer(self):
+        """Hides the window and stops the timers."""
+        print("BreakOverlayWindow: Hiding and stopping timers.")
+        # Stop elapsed timer
+        if self._elapsed_timer_id:
+            GLib.source_remove(self._elapsed_timer_id)
+            self._elapsed_timer_id = None
+        # Stop dismiss delay timer if it's still running
+        if self._dismiss_delay_timer_id:
+            print("BreakOverlayWindow: Cancelling active dismiss delay timer.")
+            GLib.source_remove(self._dismiss_delay_timer_id)
+            self._dismiss_delay_timer_id = None
+
+        # Check if not already destroyed before calling destroy
+        if hasattr(self, 'is_destroyed') and not self.is_destroyed():
+             print("BreakOverlayWindow: Calling self.destroy()")
+             self.destroy()
+        elif hasattr(self, 'props') and self.props.visible:
+             print("BreakOverlayWindow: Calling self.hide()")
+             self.hide()
+        else:
+             print("BreakOverlayWindow: Already destroyed or being destroyed/hidden.")
+
+
+    def _update_elapsed_timer(self) -> bool:
+        """Internal callback to update the elapsed time label."""
+        self._elapsed_seconds += 1
+        self._update_elapsed_label()
+        return True # Keep timer running
+
+    def _update_elapsed_label(self):
+        """Formats seconds into MM:SS and updates the label."""
+        minutes = self._elapsed_seconds // 60
+        seconds = self._elapsed_seconds % 60
+        time_str = f"{minutes:02d}:{seconds:02d}"
+        self.lbl_elapsed_time.set_label(f"Break started: {time_str}")
+
+
+    def _on_background_button_press(self, widget, event):
+        """
+        Handles clicks on the EventBox background.
+        Only dismisses if it's a primary button click AND the delay has passed.
+        """
+        if event.button == Gdk.BUTTON_PRIMARY:
+            # --- Check Dismiss Flag ---
+            if self._can_dismiss_background:
+                 print("BreakOverlayWindow: Background clicked (dismiss enabled).")
+                 self.emit('dismissed') # Emit signal BEFORE destroy
+                 self.hide_and_stop_elapsed_timer()
+            else:
+                 print("BreakOverlayWindow: Background clicked (dismiss delayed).")
+            # --- End Check ---
+            return True # Indicate event was handled (even if delayed)
+        return False
+
+
+    def _on_postpone_clicked(self, button, minutes: int):
+        """
+        Handles clicks on the postpone buttons. Works immediately.
+        """
+        print(f"BreakOverlayWindow: Postpone {minutes} min clicked.")
+        self.emit('postponed', minutes) # Emit signal BEFORE destroy
+        self.hide_and_stop_elapsed_timer()
+
+
+# --- Test Code (GTK3 - Modified for delay test) ---
+if __name__ == '__main__':
+    print("Running BreakOverlayWindow Test (GTK3 Version with Dismiss Delay)...")
+
+    main_loop = GLib.MainLoop()
+    overlay_win = None
+
+    # Signal handlers for testing
+    def on_dismissed(emitter):
+        print("[Signal Handler] ****** DISMISSED ******")
+        if main_loop.is_running(): main_loop.quit()
+
+    def on_postponed(emitter, minutes):
+        print(f"[Signal Handler] ****** POSTPONED: {minutes} minutes ******")
+        if main_loop.is_running(): main_loop.quit()
+
+    # --- Test Setup ---
+    try:
+        try: Gtk.init_check()
+        except Exception: Gtk.init(None)
+
+        overlay_win = BreakOverlayWindow()
+
+        overlay_win.connect('dismissed', on_dismissed)
+        overlay_win.connect('postponed', on_postponed)
+        overlay_win.connect('destroy', lambda w: print("[Debug] Overlay Destroy signal received.") or (main_loop.quit() if main_loop.is_running() else None))
+
+        def show_overlay():
+            print("Showing overlay...")
+            if overlay_win and hasattr(overlay_win, 'is_destroyed') and not overlay_win.is_destroyed():
+                overlay_win.show_and_start_elapsed_timer()
+                print(f"--- Try clicking background immediately (should be ignored for {BreakOverlayWindow.DISMISS_DELAY_SECONDS}s) ---")
+            else:
+                print("Error: Overlay window was destroyed before it could be shown.")
+                if main_loop.is_running(): main_loop.quit()
+            return False
+
+        GLib.timeout_add_seconds(1, show_overlay)
+
+        print("\nStarting Gtk MainLoop...")
+        main_loop.run()
+
+    except Exception as e:
+        print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)
+        if main_loop.is_running():
+             main_loop.quit()
+    finally:
+        print("\nTest finished.")
+
+
+
+===== FILE: ./__pycache__/pause_duration_dialog.cpython-311.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/sound_player.cpython-311.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/break_overlay.cpython-311.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/idle_monitor.cpython-311.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/settings_manager.cpython-311.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/tray_icon.cpython-313.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/timer_manager.cpython-313.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/timer_manager.cpython-311.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/idle_monitor.cpython-313.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/settings_manager.cpython-313.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/pause_duration_dialog.cpython-313.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/break_overlay.cpython-313.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/settings_window.cpython-313.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/tray_icon.cpython-311.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/sound_player.cpython-313.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./__pycache__/settings_window.cpython-311.pyc =====
+[BINARY FILE]
+
+
+
+===== FILE: ./icon.png =====
+[BINARY FILE]
+
+
+
