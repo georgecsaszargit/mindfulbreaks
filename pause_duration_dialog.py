@@ -47,7 +47,7 @@ class PauseDurationDialog(Gtk.Dialog):
         adjustment = Gtk.Adjustment(
             value=5,     # Default 5 minutes
             lower=1,     # Min 1 minute
-            upper=60,    # Max 1 hour (in minutes)
+            upper=1440,    # Max 24 hours (in minutes)
             step_increment=1, # Step by 1 min
             page_increment=5, # Page up/down by 5 mins
             page_size=0
