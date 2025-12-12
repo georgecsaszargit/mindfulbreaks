@@ -4,22 +4,10 @@ Name=Mindful Break
 GenericName=Break Reminder
 Comment=Take regular breaks from your computer
 Keywords=break;timer;reminder;health;ergonomics;
-
-# IMPORTANT: The paths below must be absolute.
-# This file is best used as a template for an installation script
-# that replaces placeholder paths with real ones.
-
-# TryExec checks if the main binary is present before showing the item.
-TryExec=/home/george/miniconda3/condabin/conda
-
-# The 'bash -c' command allows us to first change directory ('cd')
-# and then execute the application. This ensures the app's working
-# directory is correct for finding local files like 'notification.wav'.
-Exec=bash -c "cd '/home/george/Git_Repos/mindfulbreaks' && '/home/george/miniconda3/condabin/conda' run -n mindfulbreaks --no-capture-output --live-stream python mindful_break_app.py"
-
-Icon=/home/george/Programs/mindfulbreaks/icon.png
-
+Exec=/home/george/Scripts/mindfulbreak.sh
+Icon=/home/george/Git_Repos/mindfulbreaks/icon.png
 Terminal=false
 Type=Application
 Categories=Utility;GTK;
 StartupNotify=false
+
