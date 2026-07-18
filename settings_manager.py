@@ -9,13 +9,15 @@ class SettingsManager:
     """
     # Define keys to ensure consistency
     KEY_BREAK_INTERVAL = 'break-interval-minutes'
-    KEY_IDLE_ENABLED = 'idle-monitor-enabled'
-    KEY_IDLE_THRESHOLD = 'idle-threshold-seconds'
     # --- Added for Overlay Geometry ---
     KEY_OVERLAY_WIDTH = 'overlay-width'
     KEY_OVERLAY_HEIGHT = 'overlay-height'
     KEY_OVERLAY_TOP_MARGIN = 'overlay-top-margin'
-    KEY_OVERLAY_HORIZONTAL_CENTERED = 'overlay-horizontal-centered'    
+    KEY_OVERLAY_HORIZONTAL_CENTERED = 'overlay-horizontal-centered'
+
+    # --- Added for Schedule ---
+    KEY_SCHEDULE_ENABLED = 'schedule-enabled'
+    KEY_SCHEDULE = 'schedule'  # dict: day index (0=Mon..6=Sun) -> {"from": int, "until": int}
 
     def __init__(self):
         """
@@ -36,17 +38,32 @@ class SettingsManager:
 
         self._load_settings()
 
+    def _get_default_schedule(self) -> dict:
+        """
+        Returns the default schedule dict (0=Mon .. 6=Sun).
+        Mon-Fri (0-4): enabled, 8 to 18.
+        Sat-Sun (5-6): disabled.
+        """
+        schedule = {}
+        for d in range(7):
+            if d < 5:  # Monday-Friday
+                schedule[str(d)] = {"enabled": True, "from": 8, "until": 18}
+            else:  # Saturday-Sunday
+                schedule[str(d)] = {"enabled": False, "from": 9, "until": 17}
+        return schedule
+
     def _get_default_settings(self) -> dict:
         """Returns a dictionary with the default application settings."""
         return {
             self.KEY_BREAK_INTERVAL: 60,
-            self.KEY_IDLE_ENABLED: True,
-            self.KEY_IDLE_THRESHOLD: 3600,
             # --- Added for Overlay Geometry ---
             self.KEY_OVERLAY_WIDTH: 1000,
             self.KEY_OVERLAY_HEIGHT: 600,
             self.KEY_OVERLAY_TOP_MARGIN: 0,
-            self.KEY_OVERLAY_HORIZONTAL_CENTERED: True            
+            self.KEY_OVERLAY_HORIZONTAL_CENTERED: True,
+            # --- Added for Schedule ---
+            self.KEY_SCHEDULE_ENABLED: True,
+            self.KEY_SCHEDULE: self._get_default_schedule(),
         }
 
     def _load_settings(self):
@@ -83,16 +100,6 @@ class SettingsManager:
         """Retrieves the currently configured break interval in minutes."""
         return self._settings.get(self.KEY_BREAK_INTERVAL, self._get_default_settings()[self.KEY_BREAK_INTERVAL])
 
-    def get_idle_monitor_enabled(self) -> bool:
-        """Retrieves whether the idle monitor is enabled."""
-        return self._settings.get(self.KEY_IDLE_ENABLED, self._get_default_settings()[self.KEY_IDLE_ENABLED])
-
-    def get_idle_threshold_seconds(self) -> int:
-        """Retrieves the idle threshold in seconds."""
-        # Ensure value is reasonable on read, min 10s
-        value = self._settings.get(self.KEY_IDLE_THRESHOLD, self._get_default_settings()[self.KEY_IDLE_THRESHOLD])
-        return max(10, value)
-
     # --- Added for Overlay Geometry ---
 
     def get_overlay_width(self) -> int:
@@ -111,6 +118,76 @@ class SettingsManager:
         """Retrieves whether the overlay should be horizontally centered."""
         return self._settings.get(self.KEY_OVERLAY_HORIZONTAL_CENTERED, self._get_default_settings()[self.KEY_OVERLAY_HORIZONTAL_CENTERED])
 
+    # --- Added for Schedule ---
+
+    def get_schedule_enabled(self) -> bool:
+        """Retrieves whether the break schedule is enabled."""
+        return self._settings.get(self.KEY_SCHEDULE_ENABLED, self._get_default_settings()[self.KEY_SCHEDULE_ENABLED])
+
+    def get_schedule(self) -> dict:
+        """Retrieves the full schedule dict (0=Mon .. 6=Sun)."""
+        defaults = self._get_default_settings()
+        schedule = self._settings.get(self.KEY_SCHEDULE, defaults[self.KEY_SCHEDULE])
+        # Ensure all 7 days exist; fill missing with defaults
+        default_schedule = defaults[self.KEY_SCHEDULE]
+        result = {}
+        for d in range(7):
+            day_key = str(d)
+            day = schedule.get(day_key, default_schedule[day_key])
+            # Validate structure
+            if not isinstance(day, dict) or "from" not in day or "until" not in day:
+                day = default_schedule[day_key]
+            result[day_key] = {
+                "enabled": bool(day.get("enabled", default_schedule[day_key]["enabled"])),
+                "from": self._validate_hour(day.get("from", default_schedule[day_key]["from"])),
+                "until": self._validate_hour(day.get("until", default_schedule[day_key]["until"])),
+            }
+        return result
+
+    def get_schedule_for_day(self, day_index: int) -> dict:
+        """Retrieves the schedule for a specific day (0=Mon .. 6=Sun)."""
+        if not 0 <= day_index <= 6:
+            raise ValueError(f"day_index must be 0-6, got {day_index}")
+        return self.get_schedule()[str(day_index)]
+
+    @staticmethod
+    def _validate_hour(value) -> int:
+        """Clamps an hour value to the valid 0-23 range."""
+        try:
+            v = int(value)
+        except (ValueError, TypeError):
+            return 9
+        return max(0, min(23, v))
+
+    def is_break_allowed_now(self) -> bool:
+        """
+        Checks whether a break is allowed at the current time based on the schedule.
+
+        Returns True if the schedule is disabled (breaks always allowed),
+        or if today is enabled and the current hour is within today's
+        configured from-until window.
+        """
+        if not self.get_schedule_enabled():
+            return True
+        import datetime
+        now = datetime.datetime.now()
+        day_index = now.weekday()  # Monday=0 .. Sunday=6
+        hour = now.hour
+        day_schedule = self.get_schedule_for_day(day_index)
+        # If today is disabled, no breaks allowed
+        if not day_schedule.get("enabled", True):
+            return False
+        from_hour = day_schedule["from"]
+        until_hour = day_schedule["until"]
+        # If from == until, treat as "all day off" (no breaks allowed)
+        if from_hour == until_hour:
+            return False
+        # Normal case: from < until (same-day window)
+        if from_hour < until_hour:
+            return from_hour <= hour < until_hour
+        # Wrap-around window: from > until (e.g., 22 to 6, overnight)
+        return hour >= from_hour or hour < until_hour
+
     # --- Public Setter Methods ---
 
     def set_break_interval(self, minutes: int):
@@ -128,20 +205,34 @@ class SettingsManager:
         self._settings[self.KEY_BREAK_INTERVAL] = validated_minutes
         self._save_settings()
 
-    def set_idle_monitor_enabled(self, enabled: bool):
-        """Sets whether the idle monitor is enabled and saves to file."""
-        self._settings[self.KEY_IDLE_ENABLED] = bool(enabled)
+    # --- Added for Schedule ---
+
+    def set_schedule_enabled(self, enabled: bool):
+        """Sets whether the break schedule is enabled and saves to file."""
+        self._settings[self.KEY_SCHEDULE_ENABLED] = bool(enabled)
         self._save_settings()
 
-    def set_idle_threshold_seconds(self, seconds: int):
-        """Sets the idle threshold in seconds and saves to file."""
-        try:
-            validated_seconds = max(10, int(seconds))
-        except (ValueError, TypeError):
-            print(f"Warning: Invalid value '{seconds}' for idle threshold, using 10.", file=sys.stderr)
-            validated_seconds = 10
+    def set_schedule(self, schedule: dict):
+        """
+        Sets the full schedule dict and saves to file.
 
-        self._settings[self.KEY_IDLE_THRESHOLD] = validated_seconds
+        Args:
+            schedule: dict keyed by day index string ("0".."6"), each with
+                      {"enabled": bool, "from": int, "until": int} in 0-23 range.
+        """
+        default_schedule = self._get_default_schedule()
+        result = {}
+        for d in range(7):
+            day_key = str(d)
+            day = schedule.get(day_key, default_schedule[day_key]) if isinstance(schedule, dict) else default_schedule[day_key]
+            if not isinstance(day, dict) or "from" not in day or "until" not in day:
+                day = default_schedule[day_key]
+            result[day_key] = {
+                "enabled": bool(day.get("enabled", default_schedule[day_key]["enabled"])),
+                "from": self._validate_hour(day.get("from", default_schedule[day_key]["from"])),
+                "until": self._validate_hour(day.get("until", default_schedule[day_key]["until"])),
+            }
+        self._settings[self.KEY_SCHEDULE] = result
         self._save_settings()
 
 # --- Test Code Block ---
@@ -158,23 +249,27 @@ if __name__ == '__main__':
         manager.set_break_interval(initial_interval)
         print(f"Reset to {initial_interval}, retrieved: {manager.get_break_interval()}")
 
-        # Test Idle Enabled
-        initial_idle_enabled = manager.get_idle_monitor_enabled()
-        print(f"\nInitial idle enabled: {initial_idle_enabled}")
-        manager.set_idle_monitor_enabled(not initial_idle_enabled)
-        print(f"Set to {not initial_idle_enabled}, retrieved: {manager.get_idle_monitor_enabled()}")
-        manager.set_idle_monitor_enabled(initial_idle_enabled)
-        print(f"Reset to {initial_idle_enabled}, retrieved: {manager.get_idle_monitor_enabled()}")
+        # Test Schedule
+        print("\n--- Testing Schedule ---")
+        initial_sched_enabled = manager.get_schedule_enabled()
+        print(f"Initial schedule enabled: {initial_sched_enabled}")
+        manager.set_schedule_enabled(True)
+        print(f"Set to True, retrieved: {manager.get_schedule_enabled()}")
+        manager.set_schedule_enabled(initial_sched_enabled)
+        print(f"Reset to {initial_sched_enabled}, retrieved: {manager.get_schedule_enabled()}")
 
-        # Test Idle Threshold
-        initial_idle_threshold = manager.get_idle_threshold_seconds()
-        print(f"\nInitial idle threshold: {initial_idle_threshold}")
-        manager.set_idle_threshold_seconds(30)
-        print(f"Set to 30, retrieved: {manager.get_idle_threshold_seconds()}")
-        manager.set_idle_threshold_seconds(5) # Test minimum enforcement
-        print(f"Set to 5, retrieved: {manager.get_idle_threshold_seconds()} (should be >= 10)")
-        manager.set_idle_threshold_seconds(initial_idle_threshold)
-        print(f"Reset to {initial_idle_threshold}, retrieved: {manager.get_idle_threshold_seconds()}")
+        initial_schedule = manager.get_schedule()
+        print(f"Initial schedule: {initial_schedule}")
+        new_schedule = {str(d): {"enabled": True, "from": 10, "until": 18} for d in range(7)}
+        manager.set_schedule(new_schedule)
+        print(f"Set 10-18, retrieved: {manager.get_schedule()}")
+        manager.set_schedule(initial_schedule)
+        print(f"Reset, retrieved: {manager.get_schedule()}")
+
+        print(f"is_break_allowed_now (schedule disabled): {manager.is_break_allowed_now()}")
+        manager.set_schedule_enabled(True)
+        print(f"is_break_allowed_now (schedule enabled): {manager.is_break_allowed_now()}")
+        manager.set_schedule_enabled(initial_sched_enabled)
 
         print("\nAll tests passed if retrieved values match set/reset values (and minimums enforced).")
         print(f"\nVerify by checking the contents of the file: {manager.config_path}")

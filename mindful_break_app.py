@@ -26,7 +26,6 @@ from gi.repository import Gtk, GLib, GObject, Gio
 try:
     from settings_manager import SettingsManager
     from timer_manager import TimerManager
-    from idle_monitor import IdleMonitor
     from tray_icon import TrayIcon
     from settings_window import SettingsWindow # GTK3 version
     from break_overlay import BreakOverlayWindow # GTK3 version
@@ -40,7 +39,6 @@ except ImportError as e:
 # --- Constants ---
 APP_ID = "org.example.mindfulbreak"
 DEFAULT_SOUND_FILE = "notification.wav" # ** Update if needed **
-IDLE_POLL_INTERVAL_SECONDS = 30
 
 class MindfulBreakApp(Gtk.Application):
     """
@@ -55,16 +53,12 @@ class MindfulBreakApp(Gtk.Application):
         # Component Instances
         self.settings_manager = None
         self.timer_manager = None
-        self.idle_monitor = None
         self.tray_icon = None
         self.sound_player = None
         self.settings_window = None
         self.break_overlay_window = None
 
         # State flags and variables
-        self._idle_monitor_enabled = True
-        self._idle_threshold_seconds = 120
-        self._paused_due_to_idle = False
         self._manual_pause_timer_id = None
         self._manual_pause_remaining_seconds = 0
 
@@ -97,24 +91,11 @@ class MindfulBreakApp(Gtk.Application):
             initial_interval = self.settings_manager.get_break_interval()
             self.timer_manager.set_interval(initial_interval)
 
-            # --- Idle Monitor Setup (uses settings) ---
-            self.idle_monitor = None
-            self._idle_monitor_enabled = self.settings_manager.get_idle_monitor_enabled()
-            self._idle_threshold_seconds = self.settings_manager.get_idle_threshold_seconds()
-
-            if self._idle_monitor_enabled:
-                 print(f"Idle Monitor enabled, threshold: {self._idle_threshold_seconds}s. Initializing...")
-                 self.idle_monitor = IdleMonitor(idle_threshold_seconds=self._idle_threshold_seconds)
-                 if self.idle_monitor._initialized_successfully:
-                      self.idle_monitor.start(poll_interval_seconds=IDLE_POLL_INTERVAL_SECONDS)
-                 else:
-                      print("Warning: Idle monitor failed to initialize despite being enabled. Idle detection disabled.")
-                      self.idle_monitor = None
-            else:
-                 print("Idle Monitor disabled in settings.")
-
             # --- Tray Icon Setup ---
             self.tray_icon = TrayIcon(indicator_id=APP_ID + ".indicator")
+
+            # Initialize schedule toggle state from settings
+            self.tray_icon.set_schedule_enabled_state(self.settings_manager.get_schedule_enabled())
 
             # --- Connect signals ---
             self._connect_signals()
@@ -162,8 +143,6 @@ class MindfulBreakApp(Gtk.Application):
 
         if self.timer_manager:
             self.timer_manager.stop()
-        if self.idle_monitor:
-            self.idle_monitor.stop()
 
         if self.settings_window and hasattr(self.settings_window, 'is_destroyed') and not self.settings_window.is_destroyed():
              print("MindfulBreakApp: Destroying settings window on shutdown.")
@@ -190,18 +169,13 @@ class MindfulBreakApp(Gtk.Application):
         self.timer_manager.connect('timer_stopped', self.on_timer_stopped)
         self.timer_manager.connect('timer_started', self.on_timer_started)
 
-        # --- Idle Monitor Signals ---
-        if self.idle_monitor and self.idle_monitor._initialized_successfully:
-            self.idle_monitor.connect('user_idle', self.on_user_idle)
-            self.idle_monitor.connect('user_active', self.on_user_active)
-
         # --- Tray Icon Signals ---
         self.tray_icon.connect('start_timer_requested', self.on_start_timer_requested)
-        # self.tray_icon.connect('pause_timer_requested', self.on_pause_timer_requested) # REMOVED connection
         self.tray_icon.connect('resume_timer_requested', self.on_resume_timer_requested)
         self.tray_icon.connect('pause_for_requested', self.on_pause_for_requested)
-        self.tray_icon.connect('set_time_requested', self.on_set_time_requested)        
+        self.tray_icon.connect('set_time_requested', self.on_set_time_requested)
         self.tray_icon.connect('settings_requested', self.on_settings_requested)
+        self.tray_icon.connect('schedule_toggled', self.on_schedule_toggled)
         self.tray_icon.connect('quit_requested', self.on_quit_requested)
 
 
@@ -214,6 +188,18 @@ class MindfulBreakApp(Gtk.Application):
 
     def on_break_started(self, timer_manager):
         print("App: Break started.")
+
+        # --- Schedule check: suppress break overlay outside allowed hours ---
+        if self.settings_manager and not self.settings_manager.is_break_allowed_now():
+            print("App: Break suppressed by schedule (outside allowed hours). Restarting cycle silently.")
+            # Skip sound + overlay; restart the timer cycle without showing the break UI
+            interval = self.settings_manager.get_break_interval()
+            self.timer_manager.set_interval(interval)
+            self.timer_manager.start()
+            if self.tray_icon:
+                self.tray_icon.update_status(self.tray_icon.STATE_RUNNING, self.timer_manager.remaining_seconds)
+            return
+
         if self.sound_player:
             self.sound_player.play_break_sound()
         if self.tray_icon:
@@ -238,7 +224,7 @@ class MindfulBreakApp(Gtk.Application):
         )
 
         print("App: Connecting overlay signals...")
-        self.break_overlay_window.connect('dismissed', self.on_overlay_dismissed)        
+        self.break_overlay_window.connect('dismissed', self.on_overlay_dismissed)
         self.break_overlay_window.connect('postponed', self.on_overlay_postponed)
         self.break_overlay_window.connect('destroy', self.on_overlay_window_destroyed)
         print("App: Showing overlay...")
@@ -248,54 +234,25 @@ class MindfulBreakApp(Gtk.Application):
         if self._manual_pause_timer_id:
              return
         if self.tray_icon:
-            if self._paused_due_to_idle:
-                self.tray_icon.update_status(self.tray_icon.STATE_IDLE)
-            else:
-                self.tray_icon.update_status(self.tray_icon.STATE_PAUSED)
+            self.tray_icon.update_status(self.tray_icon.STATE_PAUSED)
 
     def on_timer_resumed(self, timer_manager):
         self._cancel_manual_pause()
-        self._paused_due_to_idle = False
         if self.tray_icon:
              self.tray_icon.update_status(self.tray_icon.STATE_RUNNING, timer_manager.remaining_seconds)
 
     def on_timer_stopped(self, timer_manager):
         self._cancel_manual_pause()
-        self._paused_due_to_idle = False
         if self.tray_icon:
             self.tray_icon.update_status(self.tray_icon.STATE_STOPPED)
 
     def on_timer_started(self, timer_manager):
          self._cancel_manual_pause() # Cancel manual pause on any start/restart/postpone
          print(f"App: Timer started/postponed. Initial seconds: {timer_manager.remaining_seconds}")
-         self._paused_due_to_idle = False
          if self.tray_icon:
              # This call is correct - it passes the initial seconds
              # The updated update_status method will now format it as MM:SS
              self.tray_icon.update_status(self.tray_icon.STATE_RUNNING, timer_manager.remaining_seconds)
-
-    # --- Idle Handlers ---
-    def on_user_idle(self, idle_monitor):
-        print("App: User is idle.")
-        if self._manual_pause_timer_id:
-            print("App: Manual pause active, ignoring idle.")
-            return
-        if self.timer_manager and self.timer_manager.state == self.timer_manager.STATE_RUNNING:
-             print("App: Pausing timer due to idle.")
-             self._paused_due_to_idle = True
-             self.timer_manager.pause()
-
-    def on_user_active(self, idle_monitor):
-        print("App: User is active.")
-        if self._manual_pause_timer_id:
-             print("App: Manual pause active, ignoring user active for main timer.")
-             self._paused_due_to_idle = False
-             return
-        if self.timer_manager and self.timer_manager.state == self.timer_manager.STATE_PAUSED and self._paused_due_to_idle:
-             print("App: Resuming timer after idle period.")
-             self.timer_manager.resume()
-        elif self._paused_due_to_idle:
-             self._paused_due_to_idle = False
 
     # --- Tray Menu Handlers ---
     def on_start_timer_requested(self, tray_icon):
@@ -305,13 +262,10 @@ class MindfulBreakApp(Gtk.Application):
         self.timer_manager.set_interval(interval)
         self.timer_manager.start()
 
-    # on_pause_timer_requested method removed
-
     def on_resume_timer_requested(self, tray_icon):
         print("App: Resume timer requested via tray.")
         if not self.timer_manager: return
         self._cancel_manual_pause()
-        self._paused_due_to_idle = False
         if self.timer_manager.state == self.timer_manager.STATE_PAUSED:
             self.timer_manager.resume()
 
@@ -356,7 +310,7 @@ class MindfulBreakApp(Gtk.Application):
 
         # Convert seconds to float minutes for the postpone method
         duration_minutes = duration_seconds / 60.0
-        self.timer_manager.postpone(duration_minutes)        
+        self.timer_manager.postpone(duration_minutes)
 
     def on_settings_requested(self, tray_icon):
         print("App: Settings requested.")
@@ -371,6 +325,15 @@ class MindfulBreakApp(Gtk.Application):
         self.settings_window = SettingsWindow(settings_manager=self.settings_manager)
         self.settings_window.connect('settings_saved', self.on_settings_saved)
         self.settings_window.connect('destroy', self.on_settings_window_destroyed)
+
+    def on_schedule_toggled(self, tray_icon, enabled):
+        """Handles the schedule enable/disable toggle from the tray icon."""
+        print(f"App: Schedule toggle requested, enabled={enabled}.")
+        if not self.settings_manager: return
+        self.settings_manager.set_schedule_enabled(enabled)
+        # Tray check item already updated by the user click; keep in sync defensively
+        if self.tray_icon:
+            self.tray_icon.set_schedule_enabled_state(enabled)
 
     def on_quit_requested(self, tray_icon):
         """Handles the quit request from the tray icon."""
@@ -387,7 +350,9 @@ class MindfulBreakApp(Gtk.Application):
             if self.timer_manager.state == self.timer_manager.STATE_STOPPED:
                  if self.tray_icon:
                       self.tray_icon.update_status(self.tray_icon.STATE_STOPPED)
-        self._update_idle_monitor_state() # Update idle monitor based on new settings
+        # Sync the tray schedule toggle with the (possibly updated) saved setting
+        if self.tray_icon and self.settings_manager:
+            self.tray_icon.set_schedule_enabled_state(self.settings_manager.get_schedule_enabled())
 
     def on_settings_window_destroyed(self, widget):
          print("App: Settings window destroyed.")
@@ -430,7 +395,6 @@ class MindfulBreakApp(Gtk.Application):
 
         dialog.destroy() # Destroy dialog before starting pause logic
 
-        self._paused_due_to_idle = False
         if self.timer_manager.state == self.timer_manager.STATE_RUNNING:
              self.timer_manager.pause()
 
@@ -450,7 +414,7 @@ class MindfulBreakApp(Gtk.Application):
             self._manual_pause_remaining_seconds = 0
             if self.timer_manager and self.timer_manager.state == self.timer_manager.STATE_PAUSED:
                  if self.tray_icon:
-                      self.on_timer_paused(self.timer_manager) # Restore visual state
+                     self.on_timer_paused(self.timer_manager) # Restore visual state
 
     def _manual_pause_tick(self):
         """Callback for the temporary manual pause timer."""
@@ -476,48 +440,6 @@ class MindfulBreakApp(Gtk.Application):
             return False # Stop this timer
         else:
             return True # Continue this timer
-
-    # --- Helper to update idle monitor state ---
-    def _update_idle_monitor_state(self):
-        """Starts or stops the idle monitor based on current settings."""
-        if not self.settings_manager: return
-        new_enabled_state = self.settings_manager.get_idle_monitor_enabled()
-        new_threshold = self.settings_manager.get_idle_threshold_seconds()
-        print(f"Updating idle monitor state. New enabled={new_enabled_state}, threshold={new_threshold}")
-
-        if self.idle_monitor: # Check if monitor exists
-            # Check if settings actually changed relevant to monitor
-            needs_restart = (self._idle_monitor_enabled != new_enabled_state or
-                             (new_enabled_state and self._idle_threshold_seconds != new_threshold))
-
-            if needs_restart or not new_enabled_state:
-                print("Stopping existing idle monitor...")
-                self.idle_monitor.stop()
-                self.idle_monitor = None
-            else:
-                 print("Idle monitor settings unchanged, leaving monitor running.")
-                 return # No need to restart if only interval changed, for example
-
-        # Update internal state variables
-        self._idle_monitor_enabled = new_enabled_state
-        self._idle_threshold_seconds = new_threshold
-
-        if self._idle_monitor_enabled:
-             # Only create/start if needed (i.e., wasn't running or needs restart)
-             if self.idle_monitor is None:
-                 print(f"Starting idle monitor with threshold {self._idle_threshold_seconds}s...")
-                 self.idle_monitor = IdleMonitor(idle_threshold_seconds=self._idle_threshold_seconds)
-                 if self.idle_monitor._initialized_successfully:
-                     # Reconnect signals
-                     self.idle_monitor.connect('user_idle', self.on_user_idle)
-                     self.idle_monitor.connect('user_active', self.on_user_active)
-                     self.idle_monitor.start(poll_interval_seconds=IDLE_POLL_INTERVAL_SECONDS)
-                 else:
-                     print("Warning: Idle monitor failed to initialize. Idle detection disabled.")
-                     self.idle_monitor = None
-        else:
-            print("Idle monitor remains disabled.")
-            self._paused_due_to_idle = False
 
 
 # --- Main Execution ---

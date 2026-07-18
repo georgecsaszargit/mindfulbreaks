@@ -28,11 +28,10 @@ APT_REQUIREMENTS=(
     "gir1.2-glib-2.0"
     "gir1.2-gtk-3.0"
     "gir1.2-ayatanaappindicator3-0.1"
-    # Runtime C Libraries for Indicators & Idle
+    # Runtime C Libraries for Indicators
     "libayatana-appindicator3-1"
     "libdbusmenu-glib4"
     "libdbusmenu-gtk3-4"
-    "libxss1"
     # Potential Runtime Dependencies for GStreamer (used by playsound/GTK)
     "gstreamer1.0-plugins-base"
     "gstreamer1.0-plugins-good"

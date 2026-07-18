@@ -24,7 +24,7 @@ except ImportError as e:
 class SettingsWindow(Gtk.Window): # Inherit from Gtk.Window
     """
     A preferences window for configuring MindfulBreak settings (GTK3 Version),
-    including break interval and idle detection.
+    including break interval and the break schedule.
     """
 
     # Signal emitted when settings are applied/saved
@@ -71,36 +71,95 @@ class SettingsWindow(Gtk.Window): # Inherit from Gtk.Window
         self.spin_break_interval.set_numeric(True)
         hbox_interval.pack_start(self.spin_break_interval, True, True, 0)
 
-        # --- Enable Idle Detection Row ---
-        hbox_idle_enable = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        vbox.pack_start(hbox_idle_enable, False, False, 5) # Less vertical space
+        # --- Schedule Section ---
+        vbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 10)
 
-        label_idle_enable = Gtk.Label(label="Enable Idle Detection:")
-        label_idle_enable.set_xalign(0)
-        hbox_idle_enable.pack_start(label_idle_enable, True, True, 0) # Allow label to expand
+        # Schedule enable row
+        hbox_sched_enable = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        vbox.pack_start(hbox_sched_enable, False, False, 5)
 
-        self.switch_idle_enable = Gtk.Switch()
-        self.switch_idle_enable.set_valign(Gtk.Align.CENTER)
-        self.switch_idle_enable.set_active(self._settings_manager.get_idle_monitor_enabled())
-        hbox_idle_enable.pack_end(self.switch_idle_enable, False, False, 0) # Pack switch at end
+        label_sched_enable = Gtk.Label(label="Enable Break Schedule:")
+        label_sched_enable.set_xalign(0)
+        hbox_sched_enable.pack_start(label_sched_enable, True, True, 0)
 
-        # --- Idle Threshold Row ---
-        hbox_idle_threshold = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        vbox.pack_start(hbox_idle_threshold, False, False, 5)
+        self.switch_schedule_enable = Gtk.Switch()
+        self.switch_schedule_enable.set_valign(Gtk.Align.CENTER)
+        self.switch_schedule_enable.set_active(self._settings_manager.get_schedule_enabled())
+        hbox_sched_enable.pack_end(self.switch_schedule_enable, False, False, 0)
 
-        label_idle_threshold = Gtk.Label(label="Idle Threshold (seconds):")
-        label_idle_threshold.set_xalign(0)
-        hbox_idle_threshold.pack_start(label_idle_threshold, False, False, 0)
+        # Schedule grid (7 days x from/until)
+        self._day_names = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                           "Friday", "Saturday", "Sunday"]
+        self._schedule_spin_from = []  # list of SpinButton, index 0=Mon..6=Sun
+        self._schedule_spin_until = []
+        self._schedule_rows = []  # list of Gtk.Box rows for sensitivity toggling
 
-        self.spin_idle_threshold = Gtk.SpinButton()
-        adjustment_threshold = Gtk.Adjustment(
-            value=self._settings_manager.get_idle_threshold_seconds(),
-            lower=10.0, upper=7200.0, step_increment=5.0, page_increment=30.0, page_size=0.0
-        )
-        self.spin_idle_threshold.set_adjustment(adjustment_threshold)
-        self.spin_idle_threshold.set_digits(0)
-        self.spin_idle_threshold.set_numeric(True)
-        hbox_idle_threshold.pack_start(self.spin_idle_threshold, True, True, 0)
+        schedule_grid = Gtk.Grid()
+        schedule_grid.set_column_spacing(10)
+        schedule_grid.set_row_spacing(5)
+        vbox.pack_start(schedule_grid, False, False, 5)
+
+        # Per-day enable checkboxes
+        self._schedule_day_checks = []  # list of Gtk.CheckButton, index 0=Mon..6=Sun
+
+        # Header row
+        lbl_blank = Gtk.Label(label="")
+        lbl_day = Gtk.Label(label="Day")
+        lbl_day.set_xalign(0)
+        lbl_from = Gtk.Label(label="From (hour)")
+        lbl_until = Gtk.Label(label="Until (hour)")
+        schedule_grid.attach(lbl_blank, 0, 0, 1, 1)
+        schedule_grid.attach(lbl_day, 1, 0, 1, 1)
+        schedule_grid.attach(lbl_from, 2, 0, 1, 1)
+        schedule_grid.attach(lbl_until, 3, 0, 1, 1)
+
+        current_schedule = self._settings_manager.get_schedule()
+        for day_idx in range(7):
+            day_key = str(day_idx)
+            day_schedule = current_schedule.get(day_key, {"enabled": True, "from": 9, "until": 17})
+
+            row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            schedule_grid.attach(row_box, 0, day_idx + 1, 4, 1)
+            self._schedule_rows.append(row_box)
+
+            # Per-day enable checkbox
+            check_day = Gtk.CheckButton()
+            check_day.set_active(day_schedule.get("enabled", True))
+            row_box.pack_start(check_day, False, False, 0)
+            self._schedule_day_checks.append(check_day)
+
+            label_day = Gtk.Label(label=self._day_names[day_idx])
+            label_day.set_xalign(0)
+            label_day.set_size_request(110, -1)
+            row_box.pack_start(label_day, False, False, 0)
+
+            spin_from = Gtk.SpinButton()
+            adj_from = Gtk.Adjustment(
+                value=day_schedule["from"], lower=0.0, upper=23.0,
+                step_increment=1.0, page_increment=1.0, page_size=0.0
+            )
+            spin_from.set_adjustment(adj_from)
+            spin_from.set_digits(0)
+            spin_from.set_numeric(True)
+            spin_from.set_range(0, 23)
+            row_box.pack_start(spin_from, False, False, 0)
+            self._schedule_spin_from.append(spin_from)
+
+            spin_until = Gtk.SpinButton()
+            adj_until = Gtk.Adjustment(
+                value=day_schedule["until"], lower=0.0, upper=23.0,
+                step_increment=1.0, page_increment=1.0, page_size=0.0
+            )
+            spin_until.set_adjustment(adj_until)
+            spin_until.set_digits(0)
+            spin_until.set_numeric(True)
+            spin_until.set_range(0, 23)
+            row_box.pack_start(spin_until, False, False, 0)
+            self._schedule_spin_until.append(spin_until)
+
+        # Connect the enable switch to toggle sensitivity of schedule rows
+        self.switch_schedule_enable.connect("notify::active", self._on_schedule_enable_toggled)
+        self._on_schedule_enable_toggled(self.switch_schedule_enable, None)
 
         # --- Separator and Buttons ---
         vbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 15) # More space before buttons
@@ -119,8 +178,8 @@ class SettingsWindow(Gtk.Window): # Inherit from Gtk.Window
         # --- Connect Signals ---
         # Store initial values for *all* settings to detect changes
         self._initial_interval = self.spin_break_interval.get_value_as_int()
-        self._initial_idle_enabled = self.switch_idle_enable.get_active()
-        self._initial_idle_threshold = self.spin_idle_threshold.get_value_as_int()
+        self._initial_schedule_enabled = self.switch_schedule_enable.get_active()
+        self._initial_schedule = self._collect_schedule_from_ui()
 
         btn_save.connect("clicked", self._on_save_clicked)
         btn_cancel.connect("clicked", self._on_cancel_clicked)
@@ -130,21 +189,40 @@ class SettingsWindow(Gtk.Window): # Inherit from Gtk.Window
         self.show_all() # Make window and widgets visible
 
 
+    def _on_schedule_enable_toggled(self, switch, gparam):
+        """Toggles sensitivity of the schedule day rows based on the enable switch."""
+        enabled = self.switch_schedule_enable.get_active()
+        for row in self._schedule_rows:
+            row.set_sensitive(enabled)
+
+    def _collect_schedule_from_ui(self) -> dict:
+        """Reads the current schedule values (including per-day enabled) from the UI into a dict."""
+        schedule = {}
+        for day_idx in range(7):
+            day_key = str(day_idx)
+            schedule[day_key] = {
+                "enabled": self._schedule_day_checks[day_idx].get_active(),
+                "from": self._schedule_spin_from[day_idx].get_value_as_int(),
+                "until": self._schedule_spin_until[day_idx].get_value_as_int(),
+            }
+        return schedule
+
+
     def _on_save_clicked(self, widget):
         """Saves all settings if changed and closes the window."""
         print("SettingsWindow: Save clicked.")
 
         # Get current values
         current_interval = self.spin_break_interval.get_value_as_int()
-        current_idle_enabled = self.switch_idle_enable.get_active()
-        current_idle_threshold = self.spin_idle_threshold.get_value_as_int()
+        current_schedule_enabled = self.switch_schedule_enable.get_active()
+        current_schedule = self._collect_schedule_from_ui()
 
         # Check if anything changed
         interval_changed = current_interval != self._initial_interval
-        idle_enabled_changed = current_idle_enabled != self._initial_idle_enabled
-        idle_threshold_changed = current_idle_threshold != self._initial_idle_threshold
+        schedule_enabled_changed = current_schedule_enabled != self._initial_schedule_enabled
+        schedule_changed = current_schedule != self._initial_schedule
 
-        if not (interval_changed or idle_enabled_changed or idle_threshold_changed):
+        if not (interval_changed or schedule_enabled_changed or schedule_changed):
             print("SettingsWindow: No changes detected.")
             self.destroy() # Close without saving if nothing changed
             return
@@ -154,10 +232,10 @@ class SettingsWindow(Gtk.Window): # Inherit from Gtk.Window
             # Save all changed values (SettingsManager handles sync internally)
             if interval_changed:
                 self._settings_manager.set_break_interval(current_interval)
-            if idle_enabled_changed:
-                 self._settings_manager.set_idle_monitor_enabled(current_idle_enabled)
-            if idle_threshold_changed:
-                 self._settings_manager.set_idle_threshold_seconds(current_idle_threshold)
+            if schedule_enabled_changed:
+                 self._settings_manager.set_schedule_enabled(current_schedule_enabled)
+            if schedule_changed:
+                 self._settings_manager.set_schedule(current_schedule)
 
             # Emit signal AFTER successfully saving
             self.emit('settings_saved', current_interval) # Keep original signature
@@ -215,8 +293,6 @@ if __name__ == '__main__':
 
             # Verify Interval (assuming the saved value is what was just set in the UI)
             saved_interval = saved_settings.get(SettingsManager.KEY_BREAK_INTERVAL)
-            # Note: We don't have the *new* value for idle/threshold easily in the test handler,
-            # but we can check the interval. The main test is that the file is written.
             if saved_interval is not None and saved_interval != new_interval:
                  print(f"[Verification] ERROR: Interval mismatch. Expected {new_interval}, got {saved_interval}")
                  settings_ok = False
@@ -224,8 +300,8 @@ if __name__ == '__main__':
                  print(f"[Verification] Interval OK ({saved_interval}).")
 
             # Print other saved values
-            print(f"[Verification] Idle Enabled saved as: {saved_settings.get(SettingsManager.KEY_IDLE_ENABLED)}")
-            print(f"[Verification] Idle Threshold saved as: {saved_settings.get(SettingsManager.KEY_IDLE_THRESHOLD)}")
+            print(f"[Verification] Schedule enabled saved as: {saved_settings.get(SettingsManager.KEY_SCHEDULE_ENABLED)}")
+            print(f"[Verification] Schedule saved as: {saved_settings.get(SettingsManager.KEY_SCHEDULE)}")
 
             if settings_ok: print("[Verification] All checks passed.")
         except Exception as e:
@@ -238,8 +314,8 @@ if __name__ == '__main__':
     try:
         settings_mgr = SettingsManager()
         print(f"Initial interval: {settings_mgr.get_break_interval()}")
-        print(f"Initial idle enabled: {settings_mgr.get_idle_monitor_enabled()}")
-        print(f"Initial idle threshold: {settings_mgr.get_idle_threshold_seconds()}")
+        print(f"Initial schedule enabled: {settings_mgr.get_schedule_enabled()}")
+        print(f"Initial schedule: {settings_mgr.get_schedule()}")
 
         try: Gtk.init_check()
         except Exception: Gtk.init(None)

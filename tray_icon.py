@@ -44,8 +44,7 @@ class TrayIcon(GObject.Object):
 
     # Define internal state constants
     STATE_RUNNING = "RUNNING"
-    STATE_PAUSED = "PAUSED"       # Represents Idle or general paused state
-    STATE_IDLE = "IDLE"         # Specific state for display label if needed, but uses PAUSED icon/menu
+    STATE_PAUSED = "PAUSED"       # General paused state
     STATE_BREAK = "BREAK_ACTIVE"
     STATE_STOPPED = "STOPPED"
     STATE_MANUAL_PAUSE = "MANUAL_PAUSE"
@@ -62,8 +61,9 @@ class TrayIcon(GObject.Object):
         # 'pause_timer_requested': (GObject.SignalFlags.RUN_FIRST, None, ()), # REMOVED
         'resume_timer_requested': (GObject.SignalFlags.RUN_FIRST, None, ()),
         'pause_for_requested': (GObject.SignalFlags.RUN_FIRST, None, ()),
-        'set_time_requested': (GObject.SignalFlags.RUN_FIRST, None, ()),        
+        'set_time_requested': (GObject.SignalFlags.RUN_FIRST, None, ()),
         'settings_requested': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'schedule_toggled': (GObject.SignalFlags.RUN_FIRST, None, (bool,)),
         'quit_requested': (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
@@ -110,6 +110,12 @@ class TrayIcon(GObject.Object):
         item_settings = Gtk.MenuItem(label="Settings")
         item_settings.connect('activate', self._on_settings_activate)
         self.menu.append(item_settings)
+
+        # --- Enable Schedule (checkable) ---
+        self.item_schedule_toggle = Gtk.CheckMenuItem(label="Enable Schedule")
+        self.item_schedule_toggle.set_active(False)
+        self.item_schedule_toggle.connect('toggled', self._on_schedule_toggle_activate)
+        self.menu.append(self.item_schedule_toggle)
 
         # --- Quit ---
         item_quit = Gtk.MenuItem(label="Quit")
@@ -158,12 +164,6 @@ class TrayIcon(GObject.Object):
 
         elif state == self.STATE_PAUSED:
             label = "Paused"
-            icon_name = self.ICON_PAUSED
-            dynamic_label = "Resume Timer"
-            dynamic_action = "resume"
-
-        elif state == self.STATE_IDLE:
-            label = "Paused (Idle)"
             icon_name = self.ICON_PAUSED
             dynamic_label = "Resume Timer"
             dynamic_action = "resume"
@@ -232,6 +232,25 @@ class TrayIcon(GObject.Object):
     def _on_settings_activate(self, widget):
         print("TrayIcon: Settings action requested.")
         self.emit('settings_requested')
+
+    def _on_schedule_toggle_activate(self, widget):
+        """Callback for the Enable Schedule check menu item."""
+        enabled = self.item_schedule_toggle.get_active()
+        print(f"TrayIcon: Schedule toggle requested, enabled={enabled}.")
+        self.emit('schedule_toggled', enabled)
+
+    def set_schedule_enabled_state(self, enabled: bool):
+        """
+        Updates the schedule check menu item state programmatically
+        without re-emitting the toggled signal.
+        """
+        print(f"TrayIcon: Setting schedule check item state to {enabled}.")
+        # Block the handler to avoid emitting schedule_toggled when syncing
+        self.item_schedule_toggle.handler_block_by_func(self._on_schedule_toggle_activate)
+        try:
+            self.item_schedule_toggle.set_active(bool(enabled))
+        finally:
+            self.item_schedule_toggle.handler_unblock_by_func(self._on_schedule_toggle_activate)
 
     def _on_quit_activate(self, widget):
         print("TrayIcon: Quit action requested.")
